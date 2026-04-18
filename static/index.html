@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GSATM-VMM</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="glass-panel">
+            <div class="logo" style="width: 50px; justify-content: center; margin-right: 10px;">
+                <div class="pulse-ring" id="status-indicator" style="transform: scale(1.5);"></div>
+                <h1 style="display: none;">NetScope</h1>
+            </div>
+
+            <div class="tabs">
+                <button class="tab-btn active" data-target="capture-view">Live Capture</button>
+                <button class="tab-btn" data-target="overview-view">Overview</button>
+                <button class="tab-btn" data-target="security-view">Security & Alerts</button>
+                <button class="tab-btn" data-target="dns-view"><i class="fas fa-globe"></i> DNS Analysis</button>
+                <button class="tab-btn" data-target="timeline-view"><i class="fas fa-stream"></i> Narrative Timeline</button>
+            </div>
+
+            <div style="flex: 1;"></div> 
+            <div class="controls" style="flex: 1; justify-content: flex-end; gap: 1rem;">
+                <input type="file" id="pcap-upload" accept=".pcap,.pcapng" style="display: none;">
+                <button id="btn-upload" class="btn btn-secondary" title="Mở file PCAP/PCAPNG có sẵn">📂 Open PCAP</button>
+                <a href="/api/download" id="btn-download" class="btn btn-secondary" title="Lưu PCAP" download="session.pcap" style="text-decoration: none; display: flex; align-items: center; justify-content: center;">💾 Save PCAP</a>
+                <button id="btn-global-analysis" class="btn btn-primary" style="margin-left: 1rem;">Run Analysis</button>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-layout" id="capture-view">
+            <!-- Capture Controls -->
+            <div class="glass-panel" style="grid-column: 1 / -1; display: flex; gap: 0.5rem; padding: 0.5rem; align-items: center; border-radius: 6px; align-self: start;">
+                <div class="select-wrapper" style="width: auto; min-width: 200px; max-width: 300px;">
+                    <select id="interface-select" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;">
+                        <option value="">Loading interfaces...</option>
+                    </select>
+                </div>
+                <button id="btn-start" class="btn btn-primary" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;" disabled>Start Capture</button>
+                <button id="btn-stop" class="btn btn-danger" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;" disabled>Stop</button>
+                <button id="btn-clear" class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;">Clear</button>
+                <div style="flex: 1; margin-left: auto;">
+                    <input type="text" id="display-filter" class="input-field" style="width: 100%; font-size: 0.85rem; padding: 0.4rem 0.75rem;"
+                        placeholder="🔍 Wireshark-like Filter (e.g. tcp.port == 443, ip.src == 192.168.1.1, protocol == DNS)...">
+                </div>
+            </div>
+
+            <!-- Packet List -->
+            <div class="packet-list-container glass-panel">
+                <div id="packet-stats"
+                    style="padding: 0.75rem 1rem; border-bottom: 1px solid var(--border-glass); display: flex; gap: 1rem; align-items: center; font-size: 0.85rem; color: var(--text-muted); background: rgba(0,0,0,0.2);">
+                    <span>Total: <strong id="stat-total" style="color: var(--text-primary);">0</strong></span>
+                    <div id="protocol-stats-list" class="protocol-stats-list"></div>
+                </div>
+                <div class="table-wrapper">
+                    <table id="packet-table">
+                        <thead>
+                            <tr>
+                                <th>No.</th>
+                                <th>Time</th>
+                                <th>Source</th>
+                                <th>Destination</th>
+                                <th>Protocol</th>
+                                <th>Length</th>
+                                <th>Info</th>
+                            </tr>
+                        </thead>
+                        <tbody id="packet-list">
+                            <!-- Packets will be inserted here -->
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination-controls">
+                    <div class="page-info">
+                        Showing <span id="page-start">0</span> to <span id="page-end">0</span> of <span
+                            id="total-packets">0</span>
+                    </div>
+                    <div class="page-actions">
+                        <select id="items-per-page">
+                            <option value="50">50 / page</option>
+                            <option value="100" selected>100 / page</option>
+                            <option value="500">500 / page</option>
+                        </select>
+                        <button id="btn-prev" class="btn btn-secondary" disabled>&lt; Prev</button>
+                        <span id="page-number">Page 1</span>
+                        <button id="btn-next" class="btn btn-secondary" disabled>Next &gt;</button>
+                    </div>
+                </div>
+                <div id="empty-state" class="empty-state">
+                    <p>No packets captured yet.</p>
+                    <p class="subtitle">Select an interface and click "Start Capture"</p>
+                </div>
+            </div>
+
+            <!-- Packet Details Sidebar -->
+            <aside class="packet-details glass-panel" id="packet-details">
+                <div class="details-header" style="flex-wrap: wrap; gap: 0.5rem;">
+                    <h2>Packet Details</h2>
+                    <div style="display: flex; gap: 0.5rem; align-items: center;">
+                        <button id="btn-follow-stream" class="btn btn-secondary" style="display: none; padding: 0.25rem 0.5rem; font-size: 0.75rem; border-color: var(--accent-primary); color: var(--accent-primary);">Follow TCP Stream</button>
+                        <span id="selected-packet-id" class="badge">None Selected</span>
+                    </div>
+                </div>
+                <div class="details-content" id="details-content">
+                    <div class="empty-selection">
+                        <p>Select a packet from the list to view detailed layers.</p>
+                    </div>
+                </div>
+            </aside>
+        </main>
+
+        <!-- Overview Dashboard -->
+        <section id="overview-view" class="analysis-layout" style="display: none; padding: 1rem;">
+            <div class="analysis-header glass-panel">
+                <h2 style="font-weight: 500; letter-spacing: 0.5px;">Network Overview</h2>
+            </div>
+
+            <div class="analysis-grid" style="grid-template-rows: max-content 1fr;">
+                <!-- I/O Graph -->
+                <div class="analysis-card glass-panel" style="grid-column: 1 / -1; align-self: start;">
+                    <h3>I/O Graph <i class="info-icon" title="Biểu đồ lưu lượng Bytes/s và Packets/s theo thời gian thực">ℹ️</i></h3>
+                    <div style="padding: 0.5rem 1rem 1rem 1rem; height: 220px; width: 100%;">
+                        <canvas id="io-chart"></canvas>
+                    </div>
+                </div>
+
+                <!-- Triage Summary -->
+                <div class="analysis-card glass-panel">
+                    <h3>PCAP Triage Summary <i class="info-icon" title="Tóm tắt nhanh trạng thái của file PCAP (chuẩn Zeek-lite)">ℹ️</i></h3>
+                    <div style="padding: 1rem; font-size: 0.9rem; line-height: 1.8; overflow-y: auto;">
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+                            <div>
+                                <span class="text-muted">Duration:</span> <strong id="sum-duration">-</strong><br>
+                                <span class="text-muted">Total Packets:</span> <strong id="sum-packets">-</strong><br>
+                                <span class="text-muted">Hosts Observed:</span> <strong id="sum-hosts">-</strong><br>
+                                <span class="text-muted">External Dests:</span> <strong id="sum-external">-</strong><br>
+                                <span class="text-muted">Long-lived Flows:</span> <strong id="sum-longflows">-</strong>
+                            </div>
+                            <div>
+                                <span class="text-muted">TCP Resets:</span> <strong id="sum-resets" class="text-danger">-</strong><br>
+                                <span class="text-muted">DNS NXDOMAIN:</span> <strong id="sum-nxdomain" class="text-danger">-</strong><br>
+                                <span class="text-muted">Suspicious DNS:</span> <strong id="sum-suspicious-dns" class="text-danger">-</strong><br>
+                                <span class="text-muted">Top Protocols:</span> <strong id="sum-protocols">-</strong><br>
+                                <span class="text-muted">Top Talkers:</span> <strong id="sum-talkers">-</strong>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Flow Stats -->
+                <div class="analysis-card glass-panel">
+                    <h3>Top Network Flows <i class="info-icon" title="Thống kê các luồng giao tiếp mạng tiêu tốn nhiều dung lượng nhất.">ℹ️</i></h3>
+                    <div class="table-wrapper">
+                        <table id="flows-table">
+                            <thead>
+                                <tr>
+                                    <th>Flow (Src &harr; Dst)</th>
+                                    <th>Packets</th>
+                                    <th>Bytes</th>
+                                </tr>
+                            </thead>
+                            <tbody id="flows-list">
+                                <tr><td colspan="3" class="text-center text-muted">Run analysis to view flows.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Narrative Timeline Dashboard -->
+        <section id="timeline-view" class="analysis-layout" style="display: none; padding: 1rem;">
+            <div class="analysis-header glass-panel">
+                <h2 style="font-weight: 500; letter-spacing: 0.5px; color: #a855f7;">Narrative Timeline</h2>
+            </div>
+            <div class="analysis-grid" style="grid-template-columns: 1fr;">
+                <div class="analysis-card glass-panel" style="height: 70vh;">
+                    <h3>Investigative Story <i class="info-icon" title="Dòng thời gian các sự kiện đáng chú ý được tái tạo tự động">ℹ️</i></h3>
+                    <div style="padding: 1rem; font-family: var(--font-mono); font-size: 0.9rem; height: 100%; overflow-y: auto; background: rgba(0,0,0,0.2); border-radius: 4px;" id="timeline-list">
+                        <div class="text-center text-muted" style="margin-top: 100px;">Run analysis to build narrative timeline.</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Security & Alerts Dashboard -->
+        <section id="security-view" class="analysis-layout" style="display: none; padding: 1rem;">
+            <div class="analysis-header glass-panel" style="display: flex; justify-content: space-between; align-items: center;">
+                <h2 style="font-weight: 500; letter-spacing: 0.5px; color: #f87171;">Security & Alerts</h2>
+                <button id="btn-incident-brief" class="btn" style="background: var(--primary); color: white; border: none;"><i class="fas fa-file-alt"></i> Generate Incident Brief</button>
+            </div>
+
+            <div class="analysis-grid" style="grid-template-rows: 1fr 1fr;">
+                <!-- Suspicious Flows -->
+                <div class="analysis-card glass-panel" style="grid-column: 1 / -1;">
+                    <h3>Suspicious Flows & Lateral Movement <i class="info-icon" title="Danh sách các luồng giao tiếp có dấu hiệu bất thường (Lateral Movement, TCP Health, Exfiltration).">ℹ️</i></h3>
+                    <div class="table-wrapper">
+                        <table id="suspicious-table">
+                            <thead>
+                                <tr>
+                                    <th>Flow 5-Tuple</th>
+                                    <th>Risk Score</th>
+                                    <th>Evidence & Alerts</th>
+                                    <th>Metadata</th>
+                                    <th style="width: 250px;" data-no-sort="true">Analysis Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="suspicious-list">
+                                <tr><td colspan="5" class="text-center text-muted">Run analysis to view suspicious flows.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Security Warnings -->
+                <div class="analysis-card glass-panel" style="grid-column: 1 / -1;">
+                    <h3>Clear-text Fields <i class="info-icon" title="Hiển thị các field clear-text quan trọng và các giá trị giải mã được (URL/Base64/JWT payload) từ packet đã phân tích.">ℹ️</i></h3>
+                    <div class="table-wrapper">
+                        <table id="creds-table">
+                            <thead>
+                                <tr>
+                                    <th>Flow</th>
+                                    <th>Field Name</th>
+                                    <th>Exposed Value</th>
+                                </tr>
+                            </thead>
+                            <tbody id="creds-list">
+                                <tr><td colspan="3" class="text-center text-muted">Run analysis to view alerts.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- DNS Analysis Dashboard -->
+        <section id="dns-view" class="analysis-layout" style="display: none; padding: 1rem;">
+            <div class="analysis-header glass-panel">
+                <h2 style="font-weight: 500; letter-spacing: 0.5px; color: #60a5fa;">DNS Analysis</h2>
+            </div>
+
+            <div class="analysis-grid" style="grid-template-columns: 1fr; grid-template-rows: 1fr;">
+                <div class="analysis-card glass-panel" style="grid-column: 1 / -1;">
+                    <h3>DNS Anomalies & Top Queries <i class="info-icon" title="Phát hiện DNS Tunneling, Malware Beaconing, hoặc tỷ lệ NXDOMAIN cao.">ℹ️</i></h3>
+                    <div class="table-wrapper">
+                        <table id="dns-table">
+                            <thead>
+                                <tr>
+                                    <th>Domain Name</th>
+                                    <th>Total Queries</th>
+                                    <th>NXDOMAIN Count</th>
+                                    <th>Anomalies / Evidence</th>
+                                    <th style="width: 200px;" data-no-sort="true">Wireshark Filter</th>
+                                </tr>
+                            </thead>
+                            <tbody id="dns-list">
+                                <tr><td colspan="5" class="text-center text-muted">Run analysis to view DNS queries.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Stream Modal -->
+        <div id="stream-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 10000; align-items: center; justify-content: center;">
+            <div class="glass-panel" style="width: 80%; height: 80%; display: flex; flex-direction: column;">
+                <div style="padding: 1rem; border-bottom: 1px solid var(--border-glass); display: flex; justify-content: space-between;">
+                    <h3 id="stream-title">TCP Stream</h3>
+                    <button id="btn-close-stream" class="btn btn-danger" style="padding: 0.25rem 0.5rem;">Close</button>
+                </div>
+                <div id="stream-content" style="flex: 1; padding: 1rem; overflow: auto; font-family: var(--font-mono); font-size: 0.85rem; white-space: pre-wrap; background: #000; color: #a78bfa;">
+                </div>
+            </div>
+        </div>
+        <!-- Incident Brief Modal -->
+        <div id="brief-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.8); z-index: 10000; align-items: center; justify-content: center;">
+            <div class="glass-panel" style="width: 60%; height: 70%; display: flex; flex-direction: column;">
+                <div style="padding: 1rem; border-bottom: 1px solid var(--border-glass); display: flex; justify-content: space-between;">
+                    <h3 id="brief-title">Incident Brief</h3>
+                    <div>
+                        <button id="btn-copy-brief" class="btn" style="background: var(--primary); margin-right: 0.5rem;">Copy Markdown</button>
+                        <button id="btn-close-brief" class="btn btn-danger" style="padding: 0.25rem 0.5rem;">Close</button>
+                    </div>
+                </div>
+                <div style="flex: 1; padding: 1rem; overflow: auto; background: #0f172a;">
+                    <textarea id="brief-content" style="width: 100%; height: 100%; background: transparent; border: none; color: #e2e8f0; font-family: var(--font-mono); resize: none; outline: none;" readonly></textarea>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+
+</html>
