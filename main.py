@@ -308,7 +308,7 @@ def extract_ftp_info(packet, sport: int, dport: int) -> str:
 
     return f"FTP Data {sport} -> {dport}"
 
-def extract_ftp_credentials(payload: bytes, src: str, dst: str, seen_keys):
+def extract_ftp_credentials(payload: bytes, src: str, dst: str, seen_keys, packet_no: Optional[int] = None):
     if not payload:
         return []
 
@@ -324,7 +324,7 @@ def extract_ftp_credentials(payload: bytes, src: str, dst: str, seen_keys):
             continue
 
         field = "username" if cmd == "USER" else "password"
-        append_credential_result(results, seen_keys, src, dst, field, value, "ftp")
+        append_credential_result(results, seen_keys, src, dst, field, value, "ftp", packet_no=packet_no)
 
     return results
 
@@ -492,6 +492,7 @@ def select_important_cleartext_rows(rows, max_rows: int = 250):
         destination = row.get("destination", "")
         field = row.get("field", "")
         value = str(row.get("value", ""))
+        packet_no = row.get("packet_no")
 
         base_score = cleartext_importance_score(field, value)
         if base_score >= 25:
@@ -499,7 +500,8 @@ def select_important_cleartext_rows(rows, max_rows: int = 250):
                 "source": source,
                 "destination": destination,
                 "field": field,
-                "value": value
+                "value": value,
+                "packet_no": packet_no
             }))
 
         for decode_method, decoded_text in decode_value_variants(value):
@@ -511,7 +513,8 @@ def select_important_cleartext_rows(rows, max_rows: int = 250):
                     "source": source,
                     "destination": destination,
                     "field": f"{strip_method_suffix(field)} [{decode_method}]",
-                    "value": decoded_text
+                    "value": decoded_text,
+                    "packet_no": packet_no
                 }))
 
             for key, pair_value in extract_inline_pairs(decoded_text)[:20]:
@@ -521,7 +524,8 @@ def select_important_cleartext_rows(rows, max_rows: int = 250):
                         "source": source,
                         "destination": destination,
                         "field": f"{key} [{decode_method}]",
-                        "value": str(pair_value)
+                        "value": str(pair_value),
+                        "packet_no": packet_no
                     }))
 
     ranked.sort(key=lambda item: item[0], reverse=True)
@@ -533,7 +537,8 @@ def select_important_cleartext_rows(rows, max_rows: int = 250):
             row.get("source", ""),
             row.get("destination", ""),
             strip_method_suffix(row.get("field", "")),
-            row.get("value", "")
+            row.get("value", ""),
+            row.get("packet_no")
         )
         if dedupe_key in dedupe:
             continue
@@ -544,7 +549,7 @@ def select_important_cleartext_rows(rows, max_rows: int = 250):
 
     return selected
 
-def append_credential_result(results, seen_keys, src, dst, field, value, method):
+def append_credential_result(results, seen_keys, src, dst, field, value, method, packet_no: Optional[int] = None):
     normalized_field = str(field).strip().lower()
     normalized_value = str(value).strip()
     if not normalized_field or not normalized_value:
@@ -557,7 +562,7 @@ def append_credential_result(results, seen_keys, src, dst, field, value, method)
     if len(normalized_value) > MAX_CRED_VALUE_LEN:
         normalized_value = normalized_value[:MAX_CRED_VALUE_LEN] + "..."
 
-    dedupe_key = (src, dst, normalized_field, normalized_value)
+    dedupe_key = (src, dst, normalized_field, normalized_value, packet_no)
     if dedupe_key in seen_keys:
         return
 
@@ -567,14 +572,15 @@ def append_credential_result(results, seen_keys, src, dst, field, value, method)
         "source": src,
         "destination": dst,
         "field": field_label,
-        "value": normalized_value
+        "value": normalized_value,
+        "packet_no": packet_no
     })
 
-def scan_credentials_in_text(text: str, src: str, dst: str, method: str, results, seen_keys):
+def scan_credentials_in_text(text: str, src: str, dst: str, method: str, results, seen_keys, packet_no: Optional[int] = None):
     for match in TEXT_CRED_REGEX.finditer(text):
         field = match.group(1)
         value = match.group(2).strip().strip('"\'')
-        append_credential_result(results, seen_keys, src, dst, field, value, method)
+        append_credential_result(results, seen_keys, src, dst, field, value, method, packet_no=packet_no)
 
         decoded = maybe_decode_base64(value)
         if not decoded:
@@ -582,8 +588,8 @@ def scan_credentials_in_text(text: str, src: str, dst: str, method: str, results
 
         if ':' in decoded:
             user, pwd = decoded.split(':', 1)
-            append_credential_result(results, seen_keys, src, dst, "username", user, f"{method}+base64")
-            append_credential_result(results, seen_keys, src, dst, "password", pwd, f"{method}+base64")
+            append_credential_result(results, seen_keys, src, dst, "username", user, f"{method}+base64", packet_no=packet_no)
+            append_credential_result(results, seen_keys, src, dst, "password", pwd, f"{method}+base64", packet_no=packet_no)
 
         for nested in TEXT_CRED_REGEX.finditer(decoded):
             append_credential_result(
@@ -593,7 +599,8 @@ def scan_credentials_in_text(text: str, src: str, dst: str, method: str, results
                 dst,
                 nested.group(1),
                 nested.group(2).strip().strip('"\''),
-                f"{method}+base64"
+                f"{method}+base64",
+                packet_no=packet_no
             )
 
     for match in TEXT_ANY_KV_REGEX.finditer(text):
@@ -601,9 +608,9 @@ def scan_credentials_in_text(text: str, src: str, dst: str, method: str, results
         value = match.group(2).strip().strip('"\'')
         if not field or not looks_user_visible_value(value):
             continue
-        append_credential_result(results, seen_keys, src, dst, field, value, method)
+        append_credential_result(results, seen_keys, src, dst, field, value, method, packet_no=packet_no)
 
-def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_keys, is_http_request: bool = False):
+def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_keys, is_http_request: bool = False, packet_no: Optional[int] = None):
     if not payload:
         return []
 
@@ -646,7 +653,7 @@ def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_ke
         for field_name, field_value in multipart_fields:
             if not looks_user_visible_value(field_value):
                 continue
-            append_credential_result(results, seen_keys, src, dst, field_name, field_value, "multipart")
+            append_credential_result(results, seen_keys, src, dst, field_name, field_value, "multipart", packet_no=packet_no)
 
     if body_for_parse:
         try:
@@ -675,35 +682,35 @@ def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_ke
 
             if key_lower in {"value", "field_value", "input_value"} and pending_field:
                 if looks_user_visible_value(value_clean):
-                    append_credential_result(results, seen_keys, src, dst, pending_field, value_clean, "form-decoded")
+                    append_credential_result(results, seen_keys, src, dst, pending_field, value_clean, "form-decoded", packet_no=packet_no)
                 pending_field = None
                 continue
 
             if looks_user_visible_value(value_clean):
-                append_credential_result(results, seen_keys, src, dst, key_clean, value_clean, "form-decoded")
+                append_credential_result(results, seen_keys, src, dst, key_clean, value_clean, "form-decoded", packet_no=packet_no)
             
 
         for pair in indexed_fields.values():
             field_name = pair.get("name", "").strip()
             field_value = pair.get("value", "").strip()
             if field_name and looks_user_visible_value(field_value):
-                append_credential_result(results, seen_keys, src, dst, field_name, field_value, "form-decoded")
+                append_credential_result(results, seen_keys, src, dst, field_name, field_value, "form-decoded", packet_no=packet_no)
 
     scan_target = body_part if body_part else text
     if "content-disposition: form-data" not in text_lower:
-        scan_credentials_in_text(scan_target, src, dst, "plaintext", results, seen_keys)
+        scan_credentials_in_text(scan_target, src, dst, "plaintext", results, seen_keys, packet_no=packet_no)
 
     if '%' in text:
         decoded_url = unquote_plus(text)
         if decoded_url != text:
-            scan_credentials_in_text(decoded_url, src, dst, "url-decoded", results, seen_keys)
+            scan_credentials_in_text(decoded_url, src, dst, "url-decoded", results, seen_keys, packet_no=packet_no)
 
     for token in BASIC_AUTH_REGEX.findall(text):
         decoded_auth = maybe_decode_base64(token)
         if decoded_auth and ':' in decoded_auth:
             user, pwd = decoded_auth.split(':', 1)
-            append_credential_result(results, seen_keys, src, dst, "username", user, "basic-auth")
-            append_credential_result(results, seen_keys, src, dst, "password", pwd, "basic-auth")
+            append_credential_result(results, seen_keys, src, dst, "username", user, "basic-auth", packet_no=packet_no)
+            append_credential_result(results, seen_keys, src, dst, "password", pwd, "basic-auth", packet_no=packet_no)
 
     try:
         first_line = text.splitlines()[0] if text else ""
@@ -713,7 +720,7 @@ def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_ke
                 query_str = parts[1].split('?', 1)[1]
                 for key, value in parse_qsl(query_str, keep_blank_values=True):
                     if looks_user_visible_value(value):
-                        append_credential_result(results, seen_keys, src, dst, key, value, "query-string")
+                        append_credential_result(results, seen_keys, src, dst, key, value, "query-string", packet_no=packet_no)
     except Exception:
         pass
 
@@ -726,7 +733,7 @@ def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_ke
                 if isinstance(parsed, dict):
                     for key, value in parsed.items():
                         if isinstance(value, (str, int, float, bool)) and looks_user_visible_value(value):
-                            append_credential_result(results, seen_keys, src, dst, key, value, "json")
+                            append_credential_result(results, seen_keys, src, dst, key, value, "json", packet_no=packet_no)
     except Exception:
         pass
 
@@ -1050,11 +1057,12 @@ async def analyze_capture():
                                     src,
                                     dst,
                                     credential_seen,
-                                    is_http_request=is_http_request_packet
+                                    is_http_request=is_http_request_packet,
+                                    packet_no=total_packets
                                 )
 
                                 if tcp.sport in (20, 21) or tcp.dport in (20, 21):
-                                    extracted.extend(extract_ftp_credentials(payload, src, dst, credential_seen))
+                                    extracted.extend(extract_ftp_credentials(payload, src, dst, credential_seen, packet_no=total_packets))
 
                                 if extracted:
                                     credentials.extend(extracted)

@@ -27,6 +27,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const tabBtns = document.querySelectorAll('.tab-btn');
     const flowsList = document.getElementById('flows-list');
     const credsList = document.getElementById('creds-list');
+    const btnExportAnalysis = document.getElementById('btn-export-analysis');
+    const exportMenu = document.getElementById('export-menu');
 
     // State
     let isCapturing = false;
@@ -45,11 +47,524 @@ document.addEventListener('DOMContentLoaded', () => {
     let statsTimer = null;
     
     let packetStats = { total: 0, byProtocol: {} };
+    const selectedProtocolFilters = new Set();
+
+    const escapeHtml = (value) => String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+
+    const csvEscape = (value) => {
+        const text = String(value ?? '');
+        const escaped = text.replace(/"/g, '""');
+        return /[",\n\r]/.test(escaped) ? `"${escaped}"` : escaped;
+    };
+
+    const toCsvRow = (...values) => values.map(csvEscape).join(',');
+
+    const formatBytesAsKb = (bytes) => {
+        if (typeof bytes !== 'number') return '-';
+        return `${(bytes / 1024).toFixed(2)} KB`;
+    };
+
+    const getSummaryRows = (analysisData) => {
+        const summary = (analysisData || {}).summary || {};
+        return [
+            ['Duration', summary.duration ?? '-'],
+            ['Total Packets', summary.total_packets ?? '-'],
+            ['Hosts Observed', summary.hosts_observed ?? '-'],
+            ['External Dests', summary.external_dests ?? '-'],
+            ['Long-lived Flows', summary.long_lived_flows ?? '-'],
+            ['TCP Resets', summary.tcp_resets ?? '-'],
+            ['DNS NXDOMAIN', summary.dns_nxdomain ?? '-'],
+            ['Suspicious DNS', summary.suspicious_names ?? '-'],
+            ['Top Protocols', summary.top_protocols ?? '-'],
+            ['Top Talkers', summary.top_talkers ?? '-']
+        ];
+    };
+
+    const toHtmlList = (items) => {
+        if (!Array.isArray(items) || items.length === 0) return '<span class="muted">-</span>';
+        return items.map(item => `<div>${escapeHtml(item)}</div>`).join('');
+    };
+
+    const toInlineText = (items) => {
+        if (!Array.isArray(items) || items.length === 0) return '-';
+        return items.map(item => String(item)).join('; ');
+    };
+
+    const setExportMenuOpen = (isOpen) => {
+        if (!exportMenu || !btnExportAnalysis) return;
+        const shouldOpen = Boolean(isOpen) && !btnExportAnalysis.disabled;
+        exportMenu.classList.toggle('open', shouldOpen);
+        btnExportAnalysis.setAttribute('aria-expanded', String(shouldOpen));
+    };
+
+    const setAnalysisExportState = (isReady) => {
+        if (!btnExportAnalysis) return;
+        btnExportAnalysis.disabled = !isReady;
+        if (!isReady) {
+            setExportMenuOpen(false);
+        }
+    };
+
+    const resetAnalysisData = () => {
+        window.lastAnalysisData = null;
+        setAnalysisExportState(false);
+    };
+
+    const buildExportTimestamp = () => {
+        const now = new Date();
+        const yyyy = now.getFullYear();
+        const mm = String(now.getMonth() + 1).padStart(2, '0');
+        const dd = String(now.getDate()).padStart(2, '0');
+        const hh = String(now.getHours()).padStart(2, '0');
+        const mi = String(now.getMinutes()).padStart(2, '0');
+        const ss = String(now.getSeconds()).padStart(2, '0');
+        return `${yyyy}${mm}${dd}-${hh}${mi}${ss}`;
+    };
+
+    const buildAnalysisExportHtml = (analysisData) => {
+        const d = analysisData || {};
+        const summaryRows = getSummaryRows(d);
+        const generatedAt = new Date().toLocaleString();
+
+        const topFlowsRows = Array.isArray(d.top_flows) && d.top_flows.length > 0
+            ? d.top_flows.map(flow => `
+                <tr>
+                    <td>${escapeHtml(flow.flow ?? '-')}</td>
+                    <td>${escapeHtml(flow.packets ?? '-')}</td>
+                    <td>${escapeHtml(formatBytesAsKb(flow.bytes))}</td>
+                </tr>
+            `).join('')
+            : '<tr><td colspan="3" class="muted">No flow data.</td></tr>';
+
+        const suspiciousRows = Array.isArray(d.suspicious_flows) && d.suspicious_flows.length > 0
+            ? d.suspicious_flows.map(flow => `
+                <tr>
+                    <td>${escapeHtml(flow.flow ?? '-')}</td>
+                    <td>${escapeHtml(flow.risk_score ?? '-')}</td>
+                    <td>${toHtmlList(flow.evidence)}</td>
+                    <td>${escapeHtml(flow.metadata ?? '-')}</td>
+                </tr>
+            `).join('')
+            : '<tr><td colspan="4" class="muted">No suspicious flows detected.</td></tr>';
+
+        const dnsRows = Array.isArray(d.dns_anomalies) && d.dns_anomalies.length > 0
+            ? d.dns_anomalies.map(item => `
+                <tr>
+                    <td>${escapeHtml(item.domain ?? '-')}</td>
+                    <td>${escapeHtml(item.count ?? '-')}</td>
+                    <td>${escapeHtml(item.nxdomain ?? '-')}</td>
+                    <td>${toHtmlList(item.evidence)}</td>
+                </tr>
+            `).join('')
+            : '<tr><td colspan="4" class="muted">No DNS data.</td></tr>';
+
+        const cleartextRows = Array.isArray(d.cleartext_fields) && d.cleartext_fields.length > 0
+            ? d.cleartext_fields.map(item => `
+                <tr>
+                    <td>#${escapeHtml(item.packet_no ?? '-')}</td>
+                    <td>${escapeHtml(item.source ?? '-')} &rarr; ${escapeHtml(item.destination ?? '-')}</td>
+                    <td>${escapeHtml(item.field ?? '-')}</td>
+                    <td>${escapeHtml(item.value ?? '-')}</td>
+                </tr>
+            `).join('')
+            : '<tr><td colspan="4" class="muted">No clear-text fields found.</td></tr>';
+
+        const timelineRows = Array.isArray(d.timeline) && d.timeline.length > 0
+            ? d.timeline.map(item => `<li>${escapeHtml(item)}</li>`).join('')
+            : '<li class="muted">No timeline events.</li>';
+
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PCAP Analysis Report</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --panel: #101a2e;
+      --border: #2a3a56;
+      --text: #e6edf7;
+      --muted: #9bb0d2;
+      --accent: #5ca7ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      color: var(--text);
+      background: radial-gradient(circle at top left, #10203f, var(--bg));
+      padding: 24px;
+    }
+    h1, h2 { margin: 0 0 12px 0; }
+    .muted { color: var(--muted); }
+    .header { margin-bottom: 20px; }
+    .section {
+      background: rgba(16, 26, 46, 0.9);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 10px;
+    }
+    .kpi {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+      background: #0f172a;
+    }
+    .kpi .label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .kpi .value {
+      margin-top: 4px;
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 8px;
+      vertical-align: top;
+      word-wrap: break-word;
+      font-size: 13px;
+    }
+    th {
+      background: #16253f;
+      color: #cfe2ff;
+      text-align: left;
+    }
+    ul {
+      margin: 0;
+      padding-left: 20px;
+    }
+    .meta {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>PCAP Analysis Report</h1>
+    <div class="meta">Generated at: ${escapeHtml(generatedAt)}</div>
+  </div>
+
+  <section class="section">
+    <h2>Summary</h2>
+    <div class="summary-grid">
+      ${summaryRows.map(([label, value]) => `
+        <div class="kpi">
+          <div class="label">${escapeHtml(label)}</div>
+          <div class="value">${escapeHtml(value)}</div>
+        </div>
+      `).join('')}
+    </div>
+  </section>
+
+  <section class="section">
+    <h2>Top Network Flows</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Flow</th>
+          <th style="width: 120px;">Packets</th>
+          <th style="width: 140px;">Bytes</th>
+        </tr>
+      </thead>
+      <tbody>${topFlowsRows}</tbody>
+    </table>
+  </section>
+
+  <section class="section">
+    <h2>Suspicious Flows</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Flow</th>
+          <th style="width: 90px;">Risk</th>
+          <th>Evidence</th>
+          <th>Metadata</th>
+        </tr>
+      </thead>
+      <tbody>${suspiciousRows}</tbody>
+    </table>
+  </section>
+
+  <section class="section">
+    <h2>DNS Anomalies</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Domain</th>
+          <th style="width: 110px;">Queries</th>
+          <th style="width: 130px;">NXDOMAIN</th>
+          <th>Evidence</th>
+        </tr>
+      </thead>
+      <tbody>${dnsRows}</tbody>
+    </table>
+  </section>
+
+  <section class="section">
+    <h2>Clear-text Fields</h2>
+    <table>
+      <thead>
+        <tr>
+          <th style="width: 110px;">Packet No.</th>
+          <th>Flow</th>
+          <th>Field</th>
+          <th>Value</th>
+        </tr>
+      </thead>
+      <tbody>${cleartextRows}</tbody>
+    </table>
+  </section>
+
+  <section class="section">
+    <h2>Timeline</h2>
+    <ul>${timelineRows}</ul>
+  </section>
+</body>
+</html>`;
+    };
+
+    const buildAnalysisExportJson = (analysisData) => JSON.stringify(analysisData || {}, null, 2);
+
+    const buildAnalysisExportText = (analysisData) => {
+        const d = analysisData || {};
+        const lines = [];
+        lines.push('PCAP Analysis Report');
+        lines.push(`Generated at: ${new Date().toLocaleString()}`);
+        lines.push('');
+
+        lines.push('Summary');
+        getSummaryRows(d).forEach(([key, value]) => lines.push(`- ${key}: ${value}`));
+        lines.push('');
+
+        lines.push('Top Network Flows');
+        if (Array.isArray(d.top_flows) && d.top_flows.length > 0) {
+            d.top_flows.forEach((flow, idx) => {
+                lines.push(`${idx + 1}. ${flow.flow ?? '-'} | packets: ${flow.packets ?? '-'} | bytes: ${formatBytesAsKb(flow.bytes)}`);
+            });
+        } else {
+            lines.push('- No flow data.');
+        }
+        lines.push('');
+
+        lines.push('Suspicious Flows');
+        if (Array.isArray(d.suspicious_flows) && d.suspicious_flows.length > 0) {
+            d.suspicious_flows.forEach((flow, idx) => {
+                lines.push(`${idx + 1}. ${flow.flow ?? '-'} | risk: ${flow.risk_score ?? '-'} | evidence: ${toInlineText(flow.evidence)}`);
+            });
+        } else {
+            lines.push('- No suspicious flows detected.');
+        }
+        lines.push('');
+
+        lines.push('DNS Anomalies');
+        if (Array.isArray(d.dns_anomalies) && d.dns_anomalies.length > 0) {
+            d.dns_anomalies.forEach((row, idx) => {
+                lines.push(`${idx + 1}. ${row.domain ?? '-'} | queries: ${row.count ?? '-'} | nxdomain: ${row.nxdomain ?? '-'} | evidence: ${toInlineText(row.evidence)}`);
+            });
+        } else {
+            lines.push('- No DNS data.');
+        }
+        lines.push('');
+
+        lines.push('Clear-text Fields');
+        if (Array.isArray(d.cleartext_fields) && d.cleartext_fields.length > 0) {
+            d.cleartext_fields.forEach((row, idx) => {
+                lines.push(`${idx + 1}. #${row.packet_no ?? '-'} | ${row.source ?? '-'} -> ${row.destination ?? '-'} | ${row.field ?? '-'} = ${row.value ?? '-'}`);
+            });
+        } else {
+            lines.push('- No clear-text fields found.');
+        }
+        lines.push('');
+
+        lines.push('Timeline');
+        if (Array.isArray(d.timeline) && d.timeline.length > 0) {
+            d.timeline.forEach((item, idx) => lines.push(`${idx + 1}. ${item}`));
+        } else {
+            lines.push('- No timeline events.');
+        }
+
+        return lines.join('\n');
+    };
+
+    const buildAnalysisExportMarkdown = (analysisData) => {
+        const d = analysisData || {};
+        let md = '# PCAP Analysis Report\n\n';
+        md += `Generated at: ${new Date().toLocaleString()}\n\n`;
+
+        md += '## Summary\n';
+        getSummaryRows(d).forEach(([key, value]) => {
+            md += `- **${key}:** ${value}\n`;
+        });
+
+        md += '\n## Top Network Flows\n';
+        md += '| Flow | Packets | Bytes |\n|---|---:|---:|\n';
+        if (Array.isArray(d.top_flows) && d.top_flows.length > 0) {
+            d.top_flows.forEach(flow => {
+                md += `| ${flow.flow ?? '-'} | ${flow.packets ?? '-'} | ${formatBytesAsKb(flow.bytes)} |\n`;
+            });
+        } else {
+            md += '| No flow data. | - | - |\n';
+        }
+
+        md += '\n## Suspicious Flows\n';
+        md += '| Flow | Risk | Evidence | Metadata |\n|---|---:|---|---|\n';
+        if (Array.isArray(d.suspicious_flows) && d.suspicious_flows.length > 0) {
+            d.suspicious_flows.forEach(flow => {
+                md += `| ${flow.flow ?? '-'} | ${flow.risk_score ?? '-'} | ${toInlineText(flow.evidence)} | ${flow.metadata ?? '-'} |\n`;
+            });
+        } else {
+            md += '| No suspicious flows detected. | - | - | - |\n';
+        }
+
+        md += '\n## DNS Anomalies\n';
+        md += '| Domain | Queries | NXDOMAIN | Evidence |\n|---|---:|---:|---|\n';
+        if (Array.isArray(d.dns_anomalies) && d.dns_anomalies.length > 0) {
+            d.dns_anomalies.forEach(row => {
+                md += `| ${row.domain ?? '-'} | ${row.count ?? '-'} | ${row.nxdomain ?? '-'} | ${toInlineText(row.evidence)} |\n`;
+            });
+        } else {
+            md += '| No DNS data. | - | - | - |\n';
+        }
+
+        md += '\n## Clear-text Fields\n';
+        md += '| Packet No. | Flow | Field | Value |\n|---:|---|---|---|\n';
+        if (Array.isArray(d.cleartext_fields) && d.cleartext_fields.length > 0) {
+            d.cleartext_fields.forEach(row => {
+                md += `| #${row.packet_no ?? '-'} | ${(row.source ?? '-') + ' -> ' + (row.destination ?? '-')} | ${row.field ?? '-'} | ${row.value ?? '-'} |\n`;
+            });
+        } else {
+            md += '| - | No clear-text fields found. | - | - |\n';
+        }
+
+        md += '\n## Timeline\n';
+        if (Array.isArray(d.timeline) && d.timeline.length > 0) {
+            d.timeline.forEach(item => {
+                md += `- ${item}\n`;
+            });
+        } else {
+            md += '- No timeline events.\n';
+        }
+
+        return md;
+    };
+
+    const buildAnalysisExportCsv = (analysisData) => {
+        const d = analysisData || {};
+        const lines = [];
+        const pushSection = (title) => {
+            if (lines.length > 0) lines.push('');
+            lines.push(csvEscape(title));
+        };
+
+        pushSection('Summary');
+        lines.push(toCsvRow('Metric', 'Value'));
+        getSummaryRows(d).forEach(([key, value]) => lines.push(toCsvRow(key, value)));
+
+        pushSection('Top Network Flows');
+        lines.push(toCsvRow('Flow', 'Packets', 'Bytes'));
+        if (Array.isArray(d.top_flows) && d.top_flows.length > 0) {
+            d.top_flows.forEach(flow => lines.push(toCsvRow(flow.flow ?? '-', flow.packets ?? '-', formatBytesAsKb(flow.bytes))));
+        } else {
+            lines.push(toCsvRow('No flow data.', '', ''));
+        }
+
+        pushSection('Suspicious Flows');
+        lines.push(toCsvRow('Flow', 'Risk', 'Evidence', 'Metadata'));
+        if (Array.isArray(d.suspicious_flows) && d.suspicious_flows.length > 0) {
+            d.suspicious_flows.forEach(flow => lines.push(toCsvRow(flow.flow ?? '-', flow.risk_score ?? '-', toInlineText(flow.evidence), flow.metadata ?? '-')));
+        } else {
+            lines.push(toCsvRow('No suspicious flows detected.', '', '', ''));
+        }
+
+        pushSection('DNS Anomalies');
+        lines.push(toCsvRow('Domain', 'Queries', 'NXDOMAIN', 'Evidence'));
+        if (Array.isArray(d.dns_anomalies) && d.dns_anomalies.length > 0) {
+            d.dns_anomalies.forEach(row => lines.push(toCsvRow(row.domain ?? '-', row.count ?? '-', row.nxdomain ?? '-', toInlineText(row.evidence))));
+        } else {
+            lines.push(toCsvRow('No DNS data.', '', '', ''));
+        }
+
+        pushSection('Clear-text Fields');
+        lines.push(toCsvRow('Packet No.', 'Flow', 'Field', 'Value'));
+        if (Array.isArray(d.cleartext_fields) && d.cleartext_fields.length > 0) {
+            d.cleartext_fields.forEach(row => lines.push(toCsvRow(`#${row.packet_no ?? '-'}`, `${row.source ?? '-'} -> ${row.destination ?? '-'}`, row.field ?? '-', row.value ?? '-')));
+        } else {
+            lines.push(toCsvRow('No clear-text fields found.', '', '', ''));
+        }
+
+        pushSection('Timeline');
+        lines.push(toCsvRow('No.', 'Event'));
+        if (Array.isArray(d.timeline) && d.timeline.length > 0) {
+            d.timeline.forEach((event, idx) => lines.push(toCsvRow(idx + 1, event)));
+        } else {
+            lines.push(toCsvRow('-', 'No timeline events.'));
+        }
+
+        return lines.join('\r\n');
+    };
+
+    const getExportPayload = (format, analysisData) => {
+        const normalized = String(format || '').toLowerCase();
+        if (normalized === 'json') {
+            return { content: buildAnalysisExportJson(analysisData), mimeType: 'application/json;charset=utf-8', extension: 'json' };
+        }
+        if (normalized === 'csv') {
+            return { content: buildAnalysisExportCsv(analysisData), mimeType: 'text/csv;charset=utf-8', extension: 'csv' };
+        }
+        if (normalized === 'txt' || normalized === 'text') {
+            return { content: buildAnalysisExportText(analysisData), mimeType: 'text/plain;charset=utf-8', extension: 'txt' };
+        }
+        if (normalized === 'md' || normalized === 'markdown') {
+            return { content: buildAnalysisExportMarkdown(analysisData), mimeType: 'text/markdown;charset=utf-8', extension: 'md' };
+        }
+        return { content: buildAnalysisExportHtml(analysisData), mimeType: 'text/html;charset=utf-8', extension: 'html' };
+    };
+
+    const downloadAnalysisReport = (format, analysisData) => {
+        const payload = getExportPayload(format, analysisData);
+        const filename = `analysis-report-${buildExportTimestamp()}.${payload.extension}`;
+        const blob = new Blob([payload.content], { type: payload.mimeType });
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.style.display = 'none';
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        a.remove();
+    };
 
     const normalizeProtocolName = (proto) => {
         const p = String(proto || 'Unknown').trim().toUpperCase();
         return p || 'UNKNOWN';
     };
+
+    resetAnalysisData();
 
     const updateStatsDisplay = () => {
         document.getElementById('stat-total').textContent = packetStats.total;
@@ -61,18 +576,40 @@ document.addEventListener('DOMContentLoaded', () => {
             .sort((a, b) => b[1] - a[1]);
 
         if (sortedProtocols.length === 0) {
+            selectedProtocolFilters.clear();
             protocolStatsList.innerHTML = '<span class="text-muted">No protocol data</span>';
             return;
         }
 
+        let prunedFilters = false;
+        const availableProtocols = new Set(sortedProtocols.map(([name]) => name));
+        for (const selected of Array.from(selectedProtocolFilters)) {
+            if (!availableProtocols.has(selected)) {
+                selectedProtocolFilters.delete(selected);
+                prunedFilters = true;
+            }
+        }
+
         protocolStatsList.innerHTML = sortedProtocols.map(([name, count]) => {
             const protoClass = getProtocolClass(name);
-            return `<span class="protocol-stat-chip"><span class="${protoClass}">${name}</span><strong>${count}</strong></span>`;
+            const isActive = selectedProtocolFilters.has(name);
+            return `
+                <button type="button" class="protocol-stat-chip ${isActive ? 'is-active' : ''}" data-protocol="${escapeHtml(name)}" aria-pressed="${isActive}">
+                    <span class="${protoClass}">${escapeHtml(name)}</span>
+                    <strong>${count}</strong>
+                </button>
+            `;
         }).join('');
+
+        if (prunedFilters) {
+            currentPage = 1;
+            scheduleTableRender(true);
+        }
     };
 
     const resetStats = () => {
         packetStats = { total: 0, byProtocol: {} };
+        selectedProtocolFilters.clear();
         updateStatsDisplay();
     };
 
@@ -381,9 +918,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const filterText = displayFilterInput.value.toLowerCase().trim();
         let filteredPackets = allPackets;
+        const hasProtocolFilter = selectedProtocolFilters.size > 0;
+
+        if (hasProtocolFilter) {
+            filteredPackets = filteredPackets.filter(pkt => selectedProtocolFilters.has(normalizeProtocolName(pkt.protocol)));
+        }
 
         if (filterText) {
-            filteredPackets = allPackets.filter(pkt => {
+            filteredPackets = filteredPackets.filter(pkt => {
                 const lowerFilter = filterText; // Already lowered
                 
                 // Simple search fallback if no operators
@@ -408,6 +950,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             else if (key === 'ip.addr') matched = (pkt.src && pkt.src.toLowerCase() === val) || (pkt.dst && pkt.dst.toLowerCase() === val);
                             else if (key === 'tcp.port' || key === 'udp.port') matched = (pkt.sport == val) || (pkt.dport == val);
                             else if (key === 'protocol') matched = (pkt.protocol && pkt.protocol.toLowerCase() === val);
+                            else if (key === 'frame.number' || key === 'frame.no' || key === 'packet.id' || key === 'packet.no' || key === 'no') matched = Number(pkt.id) === Number(val);
                         } else if (cond.includes('!=')) {
                             let parts = cond.split('!=').map(s => s.trim());
                             let key = parts[0];
@@ -418,6 +961,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             else if (key === 'ip.addr') matched = (pkt.src && pkt.src.toLowerCase() !== val) && (pkt.dst && pkt.dst.toLowerCase() !== val);
                             else if (key === 'tcp.port' || key === 'udp.port') matched = (pkt.sport != val) && (pkt.dport != val);
                             else if (key === 'protocol') matched = (pkt.protocol && pkt.protocol.toLowerCase() !== val);
+                            else if (key === 'frame.number' || key === 'frame.no' || key === 'packet.id' || key === 'packet.no' || key === 'no') matched = Number(pkt.id) !== Number(val);
                         } else if (cond.includes('contains')) {
                             let parts = cond.split('contains').map(s => s.trim());
                             let key = parts[0];
@@ -439,6 +983,8 @@ document.addEventListener('DOMContentLoaded', () => {
             });
         }
 
+        const hasAnyFilter = Boolean(filterText) || hasProtocolFilter;
+
         if (packetSort.key) {
             filteredPackets = [...filteredPackets].sort((a, b) => comparePackets(a, b, packetSort.key, packetSort.direction));
         }
@@ -446,11 +992,11 @@ document.addEventListener('DOMContentLoaded', () => {
         if (filteredPackets.length === 0) {
             pageStartSpan.textContent = 0;
             pageEndSpan.textContent = 0;
-            totalPacketsSpan.textContent = filterText ? `0 (filtered out of ${allPackets.length})` : 0;
+            totalPacketsSpan.textContent = hasAnyFilter ? `0 (filtered out of ${allPackets.length})` : 0;
             pageNumberSpan.textContent = `Page 1`;
             btnPrev.disabled = true;
             btnNext.disabled = true;
-            checkEmptyState(0);
+            checkEmptyState(allPackets.length === 0 ? 0 : 1);
             return;
         }
 
@@ -466,7 +1012,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // Update pagination UI
         pageStartSpan.textContent = startIndex + 1;
         pageEndSpan.textContent = endIndex;
-        totalPacketsSpan.textContent = filterText ? `${filteredPackets.length} (filtered out of ${allPackets.length})` : allPackets.length;
+        totalPacketsSpan.textContent = hasAnyFilter ? `${filteredPackets.length} (filtered out of ${allPackets.length})` : allPackets.length;
         pageNumberSpan.textContent = `Page ${currentPage} of ${totalPages}`;
 
         btnPrev.disabled = currentPage === 1;
@@ -599,6 +1145,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 allPackets = [];
                 packetById.clear();
                 packetDetailsById.clear();
+                resetAnalysisData();
                 resetStats();
                 currentPage = 1;
                 renderTable();
@@ -647,6 +1194,7 @@ document.addEventListener('DOMContentLoaded', () => {
         allPackets = [];
         packetById.clear();
         packetDetailsById.clear();
+        resetAnalysisData();
         resetStats();
         currentPage = 1;
         renderTable();
@@ -659,6 +1207,24 @@ document.addEventListener('DOMContentLoaded', () => {
         currentPage = 1;
         renderTable();
     });
+
+    if (protocolStatsList) {
+        protocolStatsList.addEventListener('click', (event) => {
+            const chip = event.target.closest('.protocol-stat-chip');
+            if (!chip || !chip.dataset.protocol) return;
+
+            const selectedProtocol = normalizeProtocolName(chip.dataset.protocol);
+            if (selectedProtocolFilters.has(selectedProtocol)) {
+                selectedProtocolFilters.delete(selectedProtocol);
+            } else {
+                selectedProtocolFilters.add(selectedProtocol);
+            }
+
+            currentPage = 1;
+            updateStatsDisplay();
+            renderTable();
+        });
+    }
 
     btnUpload.addEventListener('click', () => {
         pcapUpload.click();
@@ -674,6 +1240,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btnStart.disabled = true;
         btnUpload.disabled = true;
         btnUpload.textContent = "Uploading...";
+        resetAnalysisData();
 
         try {
             const res = await fetch('/api/upload', {
@@ -692,6 +1259,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 allPackets = [];
                 packetById.clear();
                 packetDetailsById.clear();
+                resetAnalysisData();
                 resetStats();
                 currentPage = 1;
                 renderTable();
@@ -708,7 +1276,7 @@ document.addEventListener('DOMContentLoaded', () => {
             alert('Error uploading file');
             stopCaptureUI();
         } finally {
-            btnUpload.textContent = "📂 Open PCAP";
+            btnUpload.textContent = "Open PCAP";
             pcapUpload.value = ''; // Reset input
         }
     });
@@ -768,12 +1336,53 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnGlobalAnalysis = document.getElementById('btn-global-analysis');
     let ioChartInstance = null;
 
+    if (btnExportAnalysis) {
+        btnExportAnalysis.addEventListener('click', (event) => {
+            event.stopPropagation();
+            if (btnExportAnalysis.disabled) return;
+
+            const isOpen = exportMenu ? exportMenu.classList.contains('open') : false;
+            setExportMenuOpen(!isOpen);
+        });
+    }
+
+    if (exportMenu) {
+        exportMenu.addEventListener('click', (event) => {
+            const optionBtn = event.target.closest('.export-option');
+            if (!optionBtn) return;
+
+            const format = optionBtn.dataset.format || 'html';
+            if (!window.lastAnalysisData) {
+                alert("Please run analysis first.");
+                setExportMenuOpen(false);
+                return;
+            }
+
+            downloadAnalysisReport(format, window.lastAnalysisData);
+            setExportMenuOpen(false);
+        });
+    }
+
+    document.addEventListener('click', (event) => {
+        if (!exportMenu || !btnExportAnalysis) return;
+        if (!exportMenu.classList.contains('open')) return;
+        if (exportMenu.contains(event.target) || btnExportAnalysis.contains(event.target)) return;
+        setExportMenuOpen(false);
+    });
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            setExportMenuOpen(false);
+        }
+    });
+
     if (btnGlobalAnalysis) {
         btnGlobalAnalysis.addEventListener('click', async () => {
             btnGlobalAnalysis.disabled = true;
             btnGlobalAnalysis.textContent = "Analyzing...";
+            setAnalysisExportState(false);
             if(flowsList) flowsList.innerHTML = '<tr><td colspan="3" class="text-center">Loading...</td></tr>';
-            if(credsList) credsList.innerHTML = '<tr><td colspan="3" class="text-center">Loading...</td></tr>';
+            if(credsList) credsList.innerHTML = '<tr><td colspan="5" class="text-center">Loading...</td></tr>';
             if(suspiciousList) suspiciousList.innerHTML = '<tr><td colspan="5" class="text-center">Loading...</td></tr>';
             if(dnsList) dnsList.innerHTML = '<tr><td colspan="4" class="text-center">Loading...</td></tr>';
 
@@ -817,6 +1426,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
 
                 window.lastAnalysisData = data;
+                setAnalysisExportState(true);
 
                 // Render Suspicious Flows
                 if (suspiciousList) {
@@ -861,15 +1471,25 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (credsList) {
                     const clearTextRows = data.cleartext_fields || data.credentials || [];
                     if (clearTextRows.length > 0) {
-                        credsList.innerHTML = clearTextRows.map(c => `
+                        credsList.innerHTML = clearTextRows.map(c => {
+                            const packetNo = Number(c.packet_no);
+                            const packetFilter = Number.isFinite(packetNo) ? `frame.number == ${packetNo}` : '';
+                            const isDisabled = packetFilter ? '' : 'disabled';
+
+                            return `
                             <tr>
-                                <td>${c.source} &rarr; ${c.destination}</td>
-                                <td class="text-danger">${c.field}</td>
-                                <td class="text-danger" style="font-weight:bold;">${c.value}</td>
+                                <td>#${escapeHtml(c.packet_no ?? '-')}</td>
+                                <td>${escapeHtml(c.source)} &rarr; ${escapeHtml(c.destination)}</td>
+                                <td class="text-danger">${escapeHtml(c.field)}</td>
+                                <td class="text-danger" style="font-weight:bold;">${escapeHtml(c.value)}</td>
+                                <td>
+                                    <button class="btn copy-filter-btn" style="padding: 0.2rem 0.5rem; font-size: 0.8rem; background: var(--primary);" data-filter="${escapeHtml(packetFilter)}" ${isDisabled}>Copy Packet Filter</button>
+                                </td>
                             </tr>
-                        `).join('');
+                            `;
+                        }).join('');
                     } else {
-                        credsList.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No important clear-text fields found.</td></tr>';
+                        credsList.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No important clear-text fields found.</td></tr>';
                     }
                 }
                 // Render Timeline
@@ -1102,7 +1722,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initPacketTableSort();
     initAnalysisTableSort('flows-table', [1, 2]);
     initAnalysisTableSort('suspicious-table', [1]);
-    initAnalysisTableSort('creds-table');
+    initAnalysisTableSort('creds-table', [0]);
     initAnalysisTableSort('dns-table', [1, 2]);
     init();
 });

@@ -34,9 +34,19 @@
             <div style="flex: 1;"></div> 
             <div class="controls" style="flex: 1; justify-content: flex-end; gap: 1rem;">
                 <input type="file" id="pcap-upload" accept=".pcap,.pcapng" style="display: none;">
-                <button id="btn-upload" class="btn btn-secondary" title="Mở file PCAP/PCAPNG có sẵn">📂 Open PCAP</button>
-                <a href="/api/download" id="btn-download" class="btn btn-secondary" title="Lưu PCAP" download="session.pcap" style="text-decoration: none; display: flex; align-items: center; justify-content: center;">💾 Save PCAP</a>
+                <button id="btn-upload" class="btn btn-secondary" title="Mở file PCAP/PCAPNG có sẵn">Open PCAP</button>
+                <a href="/api/download" id="btn-download" class="btn btn-secondary" title="Lưu PCAP" download="session.pcap" style="text-decoration: none; display: flex; align-items: center; justify-content: center;">Save PCAP</a>
                 <button id="btn-global-analysis" class="btn btn-primary" style="margin-left: 1rem;">Run Analysis</button>
+                <div class="export-dropdown">
+                    <button id="btn-export-analysis" class="btn btn-secondary export-btn" title="Xuất kết quả analysis" aria-haspopup="true" aria-expanded="false" disabled>Export</button>
+                    <div id="export-menu" class="export-menu" role="menu" aria-label="Export formats">
+                        <button type="button" class="export-option" data-format="json" role="menuitem">JSON (.json)</button>
+                        <button type="button" class="export-option" data-format="csv" role="menuitem">CSV (.csv)</button>
+                        <button type="button" class="export-option" data-format="txt" role="menuitem">Text (.txt)</button>
+                        <button type="button" class="export-option" data-format="html" role="menuitem">HTML (.html)</button>
+                        <button type="button" class="export-option" data-format="md" role="menuitem">Markdown (.md)</button>
+                    </div>
+                </div>
             </div>
         </header>
 
@@ -44,8 +54,8 @@
         <main class="main-layout" id="capture-view">
             <!-- Capture Controls -->
             <div class="glass-panel" style="grid-column: 1 / -1; display: flex; gap: 0.5rem; padding: 0.5rem; align-items: center; border-radius: 6px; align-self: start;">
-                <div class="select-wrapper" style="width: auto; min-width: 200px; max-width: 300px;">
-                    <select id="interface-select" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;">
+                <div class="select-wrapper" style="width: 30vw; min-width: 280px; max-width: 576px;">
+                    <select id="interface-select" style="padding: 0.4rem 0.75rem; font-size: 0.85rem; width: 100%; max-width: none;">
                         <option value="">Loading interfaces...</option>
                     </select>
                 </div>
@@ -54,7 +64,7 @@
                 <button id="btn-clear" class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;">Clear</button>
                 <div style="flex: 1; margin-left: auto;">
                     <input type="text" id="display-filter" class="input-field" style="width: 100%; font-size: 0.85rem; padding: 0.4rem 0.75rem;"
-                        placeholder="🔍 Wireshark-like Filter (e.g. tcp.port == 443, ip.src == 192.168.1.1, protocol == DNS)...">
+                        placeholder="Filter (e.g. tcp.port == 443, ip.src == 192.168.1.1, protocol == DNS)...">
                 </div>
             </div>
 
@@ -63,6 +73,7 @@
                 <div id="packet-stats"
                     style="padding: 0.75rem 1rem; border-bottom: 1px solid var(--border-glass); display: flex; gap: 1rem; align-items: center; font-size: 0.85rem; color: var(--text-muted); background: rgba(0,0,0,0.2);">
                     <span>Total: <strong id="stat-total" style="color: var(--text-primary);">0</strong></span>
+                    <span class="protocol-filter-hint">Click protocol chips to filter (multi-select)</span>
                     <div id="protocol-stats-list" class="protocol-stats-list"></div>
                 </div>
                 <div class="table-wrapper">
@@ -140,21 +151,49 @@
                 <!-- Triage Summary -->
                 <div class="analysis-card glass-panel">
                     <h3>PCAP Triage Summary <i class="info-icon" title="Tóm tắt nhanh trạng thái của file PCAP (chuẩn Zeek-lite)">ℹ️</i></h3>
-                    <div style="padding: 1rem; font-size: 0.9rem; line-height: 1.8; overflow-y: auto;">
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
-                            <div>
-                                <span class="text-muted">Duration:</span> <strong id="sum-duration">-</strong><br>
-                                <span class="text-muted">Total Packets:</span> <strong id="sum-packets">-</strong><br>
-                                <span class="text-muted">Hosts Observed:</span> <strong id="sum-hosts">-</strong><br>
-                                <span class="text-muted">External Dests:</span> <strong id="sum-external">-</strong><br>
-                                <span class="text-muted">Long-lived Flows:</span> <strong id="sum-longflows">-</strong>
+                    <div class="triage-summary">
+                        <div class="triage-kpi-grid">
+                            <div class="triage-kpi-card">
+                                <span class="triage-label">Duration</span>
+                                <strong id="sum-duration" class="triage-value">-</strong>
                             </div>
-                            <div>
-                                <span class="text-muted">TCP Resets:</span> <strong id="sum-resets" class="text-danger">-</strong><br>
-                                <span class="text-muted">DNS NXDOMAIN:</span> <strong id="sum-nxdomain" class="text-danger">-</strong><br>
-                                <span class="text-muted">Suspicious DNS:</span> <strong id="sum-suspicious-dns" class="text-danger">-</strong><br>
-                                <span class="text-muted">Top Protocols:</span> <strong id="sum-protocols">-</strong><br>
-                                <span class="text-muted">Top Talkers:</span> <strong id="sum-talkers">-</strong>
+                            <div class="triage-kpi-card">
+                                <span class="triage-label">Total Packets</span>
+                                <strong id="sum-packets" class="triage-value">-</strong>
+                            </div>
+                            <div class="triage-kpi-card">
+                                <span class="triage-label">Hosts Observed</span>
+                                <strong id="sum-hosts" class="triage-value">-</strong>
+                            </div>
+                            <div class="triage-kpi-card">
+                                <span class="triage-label">External Dests</span>
+                                <strong id="sum-external" class="triage-value">-</strong>
+                            </div>
+                            <div class="triage-kpi-card">
+                                <span class="triage-label">Long-lived Flows</span>
+                                <strong id="sum-longflows" class="triage-value">-</strong>
+                            </div>
+                            <div class="triage-kpi-card triage-alert-card">
+                                <span class="triage-label">TCP Resets</span>
+                                <strong id="sum-resets" class="triage-value text-danger">-</strong>
+                            </div>
+                            <div class="triage-kpi-card triage-alert-card">
+                                <span class="triage-label">DNS NXDOMAIN</span>
+                                <strong id="sum-nxdomain" class="triage-value text-danger">-</strong>
+                            </div>
+                            <div class="triage-kpi-card triage-alert-card">
+                                <span class="triage-label">Suspicious DNS</span>
+                                <strong id="sum-suspicious-dns" class="triage-value text-danger">-</strong>
+                            </div>
+                        </div>
+                        <div class="triage-detail-row">
+                            <div class="triage-detail-pill">
+                                <span class="triage-label">Top Protocols</span>
+                                <strong id="sum-protocols" class="triage-inline-value">-</strong>
+                            </div>
+                            <div class="triage-detail-pill">
+                                <span class="triage-label">Top Talkers</span>
+                                <strong id="sum-talkers" class="triage-inline-value">-</strong>
                             </div>
                         </div>
                     </div>
@@ -232,13 +271,15 @@
                         <table id="creds-table">
                             <thead>
                                 <tr>
+                                    <th>Packet No.</th>
                                     <th>Flow</th>
                                     <th>Field Name</th>
                                     <th>Exposed Value</th>
+                                    <th style="width: 180px;" data-no-sort="true">Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="creds-list">
-                                <tr><td colspan="3" class="text-center text-muted">Run analysis to view alerts.</td></tr>
+                                <tr><td colspan="5" class="text-center text-muted">Run analysis to view alerts.</td></tr>
                             </tbody>
                         </table>
                     </div>
