@@ -15,6 +15,21 @@ except ImportError:
 try:
     load_layer("tls")
     from scapy.layers.tls.all import TLSClientHello
+    # Monkeypatch for Scapy TLS attribute error bug on readConnState
+    try:
+        from scapy.layers.tls.session import readConnState
+        from scapy.layers.tls.crypto.cipher_stream import Cipher_NULL
+        from scapy.layers.tls.crypto.compression import Comp_NULL
+        
+        # Ensure class-level defaults so instances never raise AttributeError
+        # if the constructor returns early due to missing cryptography.
+        readConnState.compression = Comp_NULL()
+        readConnState.key_exchange = None
+        readConnState.cipher = Cipher_NULL()
+        readConnState.hash = None
+        readConnState.mac_len = 0
+    except Exception as e:
+        print(f"Failed to monkeypatch scapy readConnState: {e}")
 except ImportError:
     TLSClientHello = None
 from pydantic import BaseModel
@@ -763,7 +778,10 @@ def packet_to_dict(packet):
         layer_name = layer.name
         fields = {}
         for field in layer.fields_desc:
-            val = getattr(layer, field.name, None)
+            try:
+                val = getattr(layer, field.name, None)
+            except Exception as e:
+                val = f"<Error: {e}>"
             fields[field.name] = format_detail_value(val)
         
         layers.append({"layer": layer_name, "fields": fields})
@@ -987,57 +1005,70 @@ async def stop_capture():
 from rules_translator import (
     TranslateFilterRequest,
     translate_local_rules,
-    translate_via_gemini,
-    generate_semantic_fallback
+    translate_with_ai_chain,
+    generate_semantic_fallback,
+    GeminiQuotaExhaustedError,
 )
+
+
+def _sanitize_filter(raw: str) -> str:
+    """Làm sạch filter string: bỏ backtick, lấy dòng đầu tiên."""
+    return raw.strip().strip("`").strip().split("\n")[0].strip()
+
 
 @app.post("/api/translate-filter")
 async def translate_filter(req: TranslateFilterRequest):
     query_text = req.query.strip()
     if not query_text:
-        return {"success": False, "error": "Query cannot be empty", "filter": ""}
+        return {"success": False, "error": "Query không được để trống.", "filter": ""}
 
-    # Step 1: Local Rule-based translation
+    print(f"[translate-filter] Query: {query_text!r}")
+
+    # Bước 1: Local Rules (nhanh, không cần mạng)
     try:
-        compiled_local = translate_local_rules(query_text)
-        if compiled_local:
+        local_result = translate_local_rules(query_text)
+        if local_result:
+            local_result = _sanitize_filter(local_result)
+            print(f"[translate-filter] Local match → {local_result!r}")
             return {
                 "success": True,
                 "source": "local",
-                "filter": compiled_local,
-                "explanation": f"Biên dịch cục bộ (Local Rule): '{compiled_local}'"
+                "filter": local_result,
+                "explanation": f"⚡ Khớp Local Rule: {local_result}",
             }
-    except Exception as e:
-        print(f"Error in translate_local_rules: {e}")
+    except Exception as exc:
+        print(f"[translate-filter] Local rule error: {exc}")
 
-    # Step 2: AI API Fallback if GEMINI_API_KEY is configured
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if gemini_key:
-        try:
-            compiled_ai = await translate_via_gemini(query_text, gemini_key)
-            if compiled_ai:
-                return {
-                    "success": True,
-                    "source": "ai",
-                    "filter": compiled_ai,
-                    "explanation": f"Biên dịch bởi AI: '{compiled_ai}'"
-                }
-        except Exception as e:
-            print(f"Error in translate_via_gemini: {e}")
-
-    # Step 3: Heuristic Fallback
+    # Bước 2: AI Provider Chain (Gemini → OpenAI → ...)
     try:
-        fallback = generate_semantic_fallback(query_text)
+        ai_result, ai_provider = await translate_with_ai_chain(query_text)
+        if ai_result:
+            ai_result = _sanitize_filter(ai_result)
+            return {
+                "success": True,
+                "source": "ai",
+                "provider": ai_provider,
+                "filter": ai_result,
+                "explanation": f"✨ Dịch bởi {ai_provider}: {ai_result}",
+            }
+    except Exception as exc:
+        print(f"[translate-filter] AI chain error: {exc}")
+
+    # Bước 3: Heuristic Fallback (luôn trả về kết quả)
+    try:
+        fallback_result = generate_semantic_fallback(query_text)
+        fallback_result = _sanitize_filter(fallback_result)
+        print(f"[translate-filter] Fallback → {fallback_result!r}")
         return {
             "success": True,
             "source": "fallback",
-            "filter": fallback,
-            "explanation": f"Không có AI, biên dịch dự phòng thông minh: '{fallback}'"
+            "filter": fallback_result,
+            "explanation": f"🔍 Fallback heuristic: {fallback_result}",
         }
-    except Exception as e:
-        print(f"Error in generate_semantic_fallback: {e}")
-        
-    return {"success": False, "error": "Could not translate query", "filter": ""}
+    except Exception as exc:
+        print(f"[translate-filter] Fallback error: {exc}")
+
+    return {"success": False, "error": "Không thể dịch query.", "filter": ""}
 
 @app.get("/api/packet/{packet_id}")
 async def get_packet_detail(packet_id: int):

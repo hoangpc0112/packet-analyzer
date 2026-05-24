@@ -1288,70 +1288,92 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 6000);
     };
 
-    // AI / Natural Language Filter Event Bindings
+    // -----------------------------------------------------------------------
+    // AI / Natural Language Filter
+    // -----------------------------------------------------------------------
     const btnAiFilter = document.getElementById('btn-ai-filter');
+    const AI_PLACEHOLDER_DEFAULT = 'Nhập bộ lọc Wireshark hoặc mô tả bằng ngôn ngữ tự nhiên...';
+
+    /** Source metadata for toast badges */
+    const SOURCE_META = {
+        local:          { label: '⚡ Local Rule',          color: '#10b981' },
+        ai:             { label: '✨ AI Gemini',            color: '#a855f7' },
+        fallback:       { label: '🔍 Heuristic',            color: '#f59e0b' },
+        quota_exceeded: { label: '⚠️ AI Hết Quota',        color: '#ef4444' },
+    };
+
     if (btnAiFilter) {
         btnAiFilter.addEventListener('click', async () => {
             let query = displayFilterInput.value.trim();
+
+            // Cảnh báo nếu ô trống
             if (!query) {
-                displayFilterInput.placeholder = "⚠️ Nhập câu tiếng Việt hoặc tiếng Anh để dịch bộ lọc!";
+                displayFilterInput.placeholder = '⚠️ Nhập mô tả bằng tiếng Việt hoặc tiếng Anh!';
                 displayFilterInput.focus();
-                setTimeout(() => {
-                    displayFilterInput.placeholder = "Filter (e.g. tcp.port == 443, ip.src == 192.168.1.1, protocol == DNS)...";
-                }, 3000);
+                setTimeout(() => { displayFilterInput.placeholder = AI_PLACEHOLDER_DEFAULT; }, 3000);
                 return;
             }
 
-            // Tự động bóc tách nếu ô nhập liệu đang chứa bộ lọc fallback dạng contains "..." để tránh dịch lặp lồng nhau
+            // Bóc tách filter fallback dạng contains "..." để tránh dịch lồng nhau
             const containsMatch = query.match(/^contains\s+"([^"]+)"$/i);
-            if (containsMatch) {
-                query = containsMatch[1];
-            }
+            if (containsMatch) query = containsMatch[1];
 
-            const originalContent = btnAiFilter.innerHTML;
-            btnAiFilter.innerHTML = `✨ Đang dịch...`;
+            // Loading state
+            const originalHTML = btnAiFilter.innerHTML;
+            btnAiFilter.innerHTML = '✨ Đang dịch…';
             btnAiFilter.disabled = true;
-            btnAiFilter.style.opacity = '0.7';
+            btnAiFilter.style.opacity = '0.65';
 
             try {
-                const response = await fetch('/api/translate-filter', {
+                const res = await fetch('/api/translate-filter', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ query: query })
+                    body: JSON.stringify({ query }),
                 });
-                
-                const data = await response.json();
-                if (data && data.success) {
+
+                const data = await res.json();
+
+                if (data && data.success && data.filter) {
                     displayFilterInput.value = data.filter;
                     currentPage = 1;
                     renderTable();
-                    
-                    const badgeText = data.source === 'local' ? 'Local Rule ⚡' : (data.source === 'ai' ? 'AI Translated ✨' : 'Fallback Match 🔍');
-                    const badgeBg = data.source === 'local' ? '#10b981' : (data.source === 'ai' ? '#a855f7' : '#f59e0b');
-                    
-                    showToast(data.explanation, badgeText, badgeBg);
+
+                    let meta;
+                    if (data.source === 'local') {
+                        meta = SOURCE_META.local;
+                    } else if (data.source === 'ai') {
+                        // Hiển thị tên provider thực tế (Gemini, OpenAI, v.v.)
+                        const providerName = data.provider || 'AI';
+                        meta = { label: `✨ ${providerName}`, color: '#a855f7' };
+                    } else if (data.source === 'quota_exceeded') {
+                        meta = SOURCE_META.quota_exceeded;
+                    } else {
+                        meta = SOURCE_META.fallback;
+                    }
+                    showToast(data.explanation || data.filter, meta.label, meta.color);
                 } else {
-                    showToast(data.error || 'Dịch thất bại', 'Lỗi ❌', '#ef4444');
+                    const errMsg = data.error || 'Không dịch được query này.';
+                    showToast(errMsg, 'Lỗi ❌', '#ef4444');
                 }
             } catch (err) {
-                console.error(err);
-                showToast('Không kết nối được server', 'Lỗi ❌', '#ef4444');
+                console.error('[AI Filter]', err);
+                showToast('Không kết nối được server.', 'Lỗi ❌', '#ef4444');
             } finally {
-                btnAiFilter.innerHTML = originalContent;
+                btnAiFilter.innerHTML = originalHTML;
                 btnAiFilter.disabled = false;
                 btnAiFilter.style.opacity = '1';
             }
         });
-        
+
+        // Enter → lọc thường | Ctrl+Enter → lọc AI
         displayFilterInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                if (e.ctrlKey) {
-                    btnAiFilter.click();
-                } else {
-                    const btnFilter = document.getElementById('btn-filter');
-                    if (btnFilter) btnFilter.click();
-                }
+            if (e.key !== 'Enter') return;
+            e.preventDefault();
+            if (e.ctrlKey) {
+                btnAiFilter.click();
+            } else {
+                const btnFilter = document.getElementById('btn-filter');
+                if (btnFilter) btnFilter.click();
             }
         });
     }
