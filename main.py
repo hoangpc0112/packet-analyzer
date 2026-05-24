@@ -30,10 +30,23 @@ import binascii
 from urllib.parse import unquote_plus, parse_qsl
 from typing import Optional
 
-app = FastAPI(title="Packet Capture Tool")
+# Load local .env file if it exists (allows configuring GEMINI_API_KEY and other variables)
+if os.path.exists(".env"):
+    try:
+        with open(".env", "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    value_clean = value.strip().strip('"').strip("'")
+                    os.environ[key.strip()] = value_clean
+    except Exception as e:
+        print(f"Error loading .env file: {e}")
 
-MAX_FIELD_TEXT_CHARS = 512
-MAX_FIELD_BYTES_PREVIEW = 256
+app = FastAPI(title=os.getenv("APP_TITLE", "Packet Capture Tool"))
+
+MAX_FIELD_TEXT_CHARS = int(os.getenv("MAX_FIELD_TEXT_CHARS", "512"))
+MAX_FIELD_BYTES_PREVIEW = int(os.getenv("MAX_FIELD_BYTES_PREVIEW", "256"))
 CRED_REGEX = re.compile(rb'(?i)(username|user|usr|login|email|pwd|pass|password|token|api[_-]?key|secret)[=:]\s*([^&"\'\s]+)')
 TEXT_CRED_REGEX = re.compile(r'(?i)\b(username|user|usr|login|email|pwd|pass|password|token|apikey|api_key|secret)\b[\s"\']{0,3}[:=]\s*["\']?([^&\s"\'\r\n;]+)')
 TEXT_ANY_KV_REGEX = re.compile(r'(?im)\b([a-zA-Z][\w.\-\[\]]{0,80})\b\s*[:=]\s*["\']?([^&\r\n;]{1,240})')
@@ -66,8 +79,8 @@ NOISE_FIELD_NAMES = {
     "content-disposition",
     "name"
 }
-MAX_CRED_VALUE_LEN = 240
-MAX_PAYLOAD_SCAN_BYTES = 8192
+MAX_CRED_VALUE_LEN = int(os.getenv("MAX_CRED_VALUE_LEN", "240"))
+MAX_PAYLOAD_SCAN_BYTES = int(os.getenv("MAX_PAYLOAD_SCAN_BYTES", "8192"))
 ENABLE_TLS_SNI = os.getenv("ENABLE_TLS_SNI", "0") == "1"
 
 # Silence noisy Scapy warnings (e.g. unknown TLS cipher suites in malformed/legacy handshakes).
@@ -111,8 +124,8 @@ class CaptureState:
         self.packet_cache = {} # id -> detailed packet info
         self.flow_states = {} # Stateful TCP tracking
         self.pcap_writer = None
-        self.max_cache_size = 50000
-        self.upload_batch_size = 250
+        self.max_cache_size = int(os.getenv("MAX_CACHE_SIZE", "50000"))
+        self.upload_batch_size = int(os.getenv("UPLOAD_BATCH_SIZE", "250"))
 
 capture_state = CaptureState()
 
@@ -971,6 +984,61 @@ async def stop_capture():
     # Scapy's sniff will eventually see stop_filter=True and exit the thread
     return {"status": "stopped"}
 
+from rules_translator import (
+    TranslateFilterRequest,
+    translate_local_rules,
+    translate_via_gemini,
+    generate_semantic_fallback
+)
+
+@app.post("/api/translate-filter")
+async def translate_filter(req: TranslateFilterRequest):
+    query_text = req.query.strip()
+    if not query_text:
+        return {"success": False, "error": "Query cannot be empty", "filter": ""}
+
+    # Step 1: Local Rule-based translation
+    try:
+        compiled_local = translate_local_rules(query_text)
+        if compiled_local:
+            return {
+                "success": True,
+                "source": "local",
+                "filter": compiled_local,
+                "explanation": f"Biên dịch cục bộ (Local Rule): '{compiled_local}'"
+            }
+    except Exception as e:
+        print(f"Error in translate_local_rules: {e}")
+
+    # Step 2: AI API Fallback if GEMINI_API_KEY is configured
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if gemini_key:
+        try:
+            compiled_ai = await translate_via_gemini(query_text, gemini_key)
+            if compiled_ai:
+                return {
+                    "success": True,
+                    "source": "ai",
+                    "filter": compiled_ai,
+                    "explanation": f"Biên dịch bởi AI: '{compiled_ai}'"
+                }
+        except Exception as e:
+            print(f"Error in translate_via_gemini: {e}")
+
+    # Step 3: Heuristic Fallback
+    try:
+        fallback = generate_semantic_fallback(query_text)
+        return {
+            "success": True,
+            "source": "fallback",
+            "filter": fallback,
+            "explanation": f"Không có AI, biên dịch dự phòng thông minh: '{fallback}'"
+        }
+    except Exception as e:
+        print(f"Error in generate_semantic_fallback: {e}")
+        
+    return {"success": False, "error": "Could not translate query", "filter": ""}
+
 @app.get("/api/packet/{packet_id}")
 async def get_packet_detail(packet_id: int):
     detail = capture_state.packet_cache.get(packet_id)
@@ -1474,4 +1542,7 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    reload = os.getenv("RELOAD", "True").lower() in ("true", "1", "yes")
+    uvicorn.run("main:app", host=host, port=port, reload=reload)

@@ -929,7 +929,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const lowerFilter = filterText; // Already lowered
                 
                 // Simple search fallback if no operators
-                if (!lowerFilter.includes('==') && !lowerFilter.includes('!=') && !lowerFilter.includes('contains')) {
+                if (!lowerFilter.includes('==') && !lowerFilter.includes('!=') && !lowerFilter.includes('contains') && !lowerFilter.includes('>') && !lowerFilter.includes('<')) {
                     return (pkt.src && pkt.src.toLowerCase().includes(lowerFilter)) ||
                            (pkt.dst && pkt.dst.toLowerCase().includes(lowerFilter)) ||
                            (pkt.protocol && pkt.protocol.toLowerCase().includes(lowerFilter)) ||
@@ -951,6 +951,7 @@ document.addEventListener('DOMContentLoaded', () => {
                             else if (key === 'tcp.port' || key === 'udp.port') matched = (pkt.sport == val) || (pkt.dport == val);
                             else if (key === 'protocol') matched = (pkt.protocol && pkt.protocol.toLowerCase() === val);
                             else if (key === 'frame.number' || key === 'frame.no' || key === 'packet.id' || key === 'packet.no' || key === 'no') matched = Number(pkt.id) === Number(val);
+                            else if (key === 'http.request.method') matched = (pkt.info && pkt.info.toLowerCase().includes(val.toLowerCase()));
                         } else if (cond.includes('!=')) {
                             let parts = cond.split('!=').map(s => s.trim());
                             let key = parts[0];
@@ -962,15 +963,42 @@ document.addEventListener('DOMContentLoaded', () => {
                             else if (key === 'tcp.port' || key === 'udp.port') matched = (pkt.sport != val) && (pkt.dport != val);
                             else if (key === 'protocol') matched = (pkt.protocol && pkt.protocol.toLowerCase() !== val);
                             else if (key === 'frame.number' || key === 'frame.no' || key === 'packet.id' || key === 'packet.no' || key === 'no') matched = Number(pkt.id) !== Number(val);
+                            else if (key === 'http.request.method') matched = !(pkt.info && pkt.info.toLowerCase().includes(val.toLowerCase()));
                         } else if (cond.includes('contains')) {
                             let parts = cond.split('contains').map(s => s.trim());
                             let key = parts[0];
-                            let val = parts[1].replace(/"/g, '').replace(/'/g, '');
+                            let val = parts[1].replace(/"/g, '').replace(/'/g, '').toLowerCase();
                             
                             if (key === 'dns.qry.name') matched = (pkt.info && pkt.info.toLowerCase().includes(val));
+                            else if (key === 'http.content_type') matched = (pkt.info && (pkt.info.toLowerCase().includes(val) || pkt.info.toLowerCase().includes('png') || pkt.info.toLowerCase().includes('jpg') || pkt.info.toLowerCase().includes('gif') || pkt.info.toLowerCase().includes('webp')));
                             else {
                                 const searchable = `${pkt.src || ''} ${pkt.dst || ''} ${pkt.protocol || ''} ${pkt.info || ''}`.toLowerCase();
                                 matched = searchable.includes(val);
+                            }
+                        } else if (cond === 'tcp.analysis.flags' || cond.includes('tcp.analysis')) {
+                            matched = (pkt.info && (pkt.info.toLowerCase().includes('retransmission') || pkt.info.toLowerCase().includes('dup ack') || pkt.info.toLowerCase().includes('out-of-order') || pkt.info.toLowerCase().includes('spurious')));
+                        } else if (cond.includes('>=') || cond.includes('<=') || cond.includes('>') || cond.includes('<')) {
+                            let op = cond.includes('>=') ? '>=' : (cond.includes('<=') ? '<=' : (cond.includes('>') ? '>' : '<'));
+                            let parts = cond.split(op).map(s => s.trim());
+                            let key = parts[0];
+                            let val = Number(parts[1]);
+                            
+                            let fieldVal = 0;
+                            if (key === 'frame.len' || key === 'frame.length' || key === 'length' || key === 'len') {
+                                fieldVal = Number(pkt.length || 0);
+                                if (op === '>') matched = fieldVal > val;
+                                else if (op === '<') matched = fieldVal < val;
+                                else if (op === '>=') matched = fieldVal >= val;
+                                else if (op === '<=') matched = fieldVal <= val;
+                            } else if (key === 'tcp.len') {
+                                if (pkt.protocol && pkt.protocol.toLowerCase() === 'tcp') {
+                                    fieldVal = Number(pkt.length || 0) - 54; // Approximation of TCP payload length
+                                    if (fieldVal < 0) fieldVal = 0;
+                                    if (op === '>') matched = fieldVal > val;
+                                    else if (op === '<') matched = fieldVal < val;
+                                    else if (op === '>=') matched = fieldVal >= val;
+                                    else if (op === '<=') matched = fieldVal <= val;
+                                }
                             }
                         }
                         
@@ -1203,10 +1231,138 @@ document.addEventListener('DOMContentLoaded', () => {
         selectedPacketRow = null;
     });
 
-    displayFilterInput.addEventListener('input', () => {
-        currentPage = 1;
-        renderTable();
-    });
+    // Premium custom glassmorphic toast notification
+    const showToast = (message, title = 'NetScope AI', bg = '#a855f7') => {
+        let toastContainer = document.getElementById('netscope-toast-container');
+        if (!toastContainer) {
+            toastContainer = document.createElement('div');
+            toastContainer.id = 'netscope-toast-container';
+            toastContainer.style.position = 'fixed';
+            toastContainer.style.bottom = '20px';
+            toastContainer.style.right = '20px';
+            toastContainer.style.zIndex = '99999';
+            toastContainer.style.display = 'flex';
+            toastContainer.style.flexDirection = 'column';
+            toastContainer.style.gap = '10px';
+            document.body.appendChild(toastContainer);
+        }
+
+        const toast = document.createElement('div');
+        toast.className = 'glass-panel';
+        toast.style.background = 'rgba(16, 26, 46, 0.9)';
+        toast.style.border = `1px solid ${bg}`;
+        toast.style.borderRadius = '8px';
+        toast.style.padding = '12px 16px';
+        toast.style.boxShadow = '0 8px 32px 0 rgba(0, 0, 0, 0.5)';
+        toast.style.backdropFilter = 'blur(8px)';
+        toast.style.color = '#e2e8f0';
+        toast.style.minWidth = '300px';
+        toast.style.maxWidth = '420px';
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateY(20px)';
+        toast.style.transition = 'all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275)';
+
+        toast.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                <strong style="color: ${bg}; font-size: 0.85rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;">${title}</strong>
+                <span style="font-size: 0.75rem; color: var(--text-muted); cursor: pointer;" onclick="this.parentElement.parentElement.remove()">✕</span>
+            </div>
+            <p style="margin: 0; font-size: 0.8rem; line-height: 1.4; color: #cbd5e1;">${message}</p>
+        `;
+
+        toastContainer.appendChild(toast);
+
+        // Animate in
+        setTimeout(() => {
+            toast.style.opacity = '1';
+            toast.style.transform = 'translateY(0)';
+        }, 50);
+
+        // Animate out
+        setTimeout(() => {
+            if (toast.parentElement) {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(-20px)';
+                setTimeout(() => toast.remove(), 400);
+            }
+        }, 6000);
+    };
+
+    // AI / Natural Language Filter Event Bindings
+    const btnAiFilter = document.getElementById('btn-ai-filter');
+    if (btnAiFilter) {
+        btnAiFilter.addEventListener('click', async () => {
+            let query = displayFilterInput.value.trim();
+            if (!query) {
+                displayFilterInput.placeholder = "⚠️ Nhập câu tiếng Việt hoặc tiếng Anh để dịch bộ lọc!";
+                displayFilterInput.focus();
+                setTimeout(() => {
+                    displayFilterInput.placeholder = "Filter (e.g. tcp.port == 443, ip.src == 192.168.1.1, protocol == DNS)...";
+                }, 3000);
+                return;
+            }
+
+            // Tự động bóc tách nếu ô nhập liệu đang chứa bộ lọc fallback dạng contains "..." để tránh dịch lặp lồng nhau
+            const containsMatch = query.match(/^contains\s+"([^"]+)"$/i);
+            if (containsMatch) {
+                query = containsMatch[1];
+            }
+
+            const originalContent = btnAiFilter.innerHTML;
+            btnAiFilter.innerHTML = `✨ Đang dịch...`;
+            btnAiFilter.disabled = true;
+            btnAiFilter.style.opacity = '0.7';
+
+            try {
+                const response = await fetch('/api/translate-filter', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: query })
+                });
+                
+                const data = await response.json();
+                if (data && data.success) {
+                    displayFilterInput.value = data.filter;
+                    currentPage = 1;
+                    renderTable();
+                    
+                    const badgeText = data.source === 'local' ? 'Local Rule ⚡' : (data.source === 'ai' ? 'AI Translated ✨' : 'Fallback Match 🔍');
+                    const badgeBg = data.source === 'local' ? '#10b981' : (data.source === 'ai' ? '#a855f7' : '#f59e0b');
+                    
+                    showToast(data.explanation, badgeText, badgeBg);
+                } else {
+                    showToast(data.error || 'Dịch thất bại', 'Lỗi ❌', '#ef4444');
+                }
+            } catch (err) {
+                console.error(err);
+                showToast('Không kết nối được server', 'Lỗi ❌', '#ef4444');
+            } finally {
+                btnAiFilter.innerHTML = originalContent;
+                btnAiFilter.disabled = false;
+                btnAiFilter.style.opacity = '1';
+            }
+        });
+        
+        displayFilterInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (e.ctrlKey) {
+                    btnAiFilter.click();
+                } else {
+                    const btnFilter = document.getElementById('btn-filter');
+                    if (btnFilter) btnFilter.click();
+                }
+            }
+        });
+    }
+
+    const btnFilter = document.getElementById('btn-filter');
+    if (btnFilter) {
+        btnFilter.addEventListener('click', () => {
+            currentPage = 1;
+            renderTable();
+        });
+    }
 
     if (protocolStatsList) {
         protocolStatsList.addEventListener('click', (event) => {
