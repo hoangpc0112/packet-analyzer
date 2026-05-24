@@ -35,7 +35,7 @@
             <div class="controls" style="flex: 1; justify-content: flex-end; gap: 1rem;">
                 <input type="file" id="pcap-upload" accept=".pcap,.pcapng" style="display: none;">
                 <button id="btn-upload" class="btn btn-secondary" title="Mở file PCAP/PCAPNG có sẵn">Open PCAP</button>
-                <a href="/api/download" id="btn-download" class="btn btn-secondary" title="Lưu PCAP" download="session.pcap" style="text-decoration: none; display: flex; align-items: center; justify-content: center;">Save PCAP</a>
+                <a href="/api/download" id="btn-download" class="btn btn-secondary" title="Lưu PCAP" download="session.pcap" aria-disabled="true" tabindex="-1" style="text-decoration: none; display: flex; align-items: center; justify-content: center;">Save PCAP</a>
                 <button id="btn-global-analysis" class="btn btn-primary" style="margin-left: 1rem;">Run Analysis</button>
                 <div class="export-dropdown">
                     <button id="btn-export-analysis" class="btn btn-secondary export-btn" title="Xuất kết quả analysis" aria-haspopup="true" aria-expanded="false" disabled>Export</button>
@@ -272,7 +272,7 @@
 
                 <!-- Security Warnings -->
                 <div class="analysis-card glass-panel" style="grid-column: 1 / -1;">
-                    <h3>Clear-text Fields <i class="info-icon" title="Hiển thị các field clear-text quan trọng và các giá trị giải mã được (URL/Base64/JWT payload) từ packet đã phân tích.">ℹ️</i></h3>
+                    <h3>Clear-text Fields <i class="info-icon" title="Hiển thị các field clear-text quan trọng, giá trị giải mã (URL/Base64/JWT payload), và phát hiện PII/secret bằng Presidio + YARA từ packet đã phân tích.">ℹ️</i></h3>
                     <div class="table-wrapper">
                         <table id="creds-table">
                             <thead>

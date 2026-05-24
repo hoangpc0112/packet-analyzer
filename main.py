@@ -82,6 +82,25 @@ NOISE_FIELD_NAMES = {
 MAX_CRED_VALUE_LEN = int(os.getenv("MAX_CRED_VALUE_LEN", "240"))
 MAX_PAYLOAD_SCAN_BYTES = int(os.getenv("MAX_PAYLOAD_SCAN_BYTES", "8192"))
 ENABLE_TLS_SNI = os.getenv("ENABLE_TLS_SNI", "0") == "1"
+ENABLE_PRESIDIO = os.getenv("ENABLE_PRESIDIO", "1") == "1"
+ENABLE_YARA = os.getenv("ENABLE_YARA", "1") == "1"
+PRESIDIO_MIN_SCORE = float(os.getenv("PRESIDIO_MIN_SCORE", "0.6"))
+PRESIDIO_MAX_TEXT_CHARS = int(os.getenv("PRESIDIO_MAX_TEXT_CHARS", "4096"))
+PRESIDIO_ALLOWED_ENTITIES = {
+    ent.strip().upper()
+    for ent in os.getenv(
+        "PRESIDIO_ALLOWED_ENTITIES",
+        "EMAIL_ADDRESS,PHONE_NUMBER,US_SSN,CREDIT_CARD,IP_ADDRESS,IBAN_CODE"
+    ).split(",")
+    if ent.strip()
+}
+YARA_RULES_DIR = os.getenv("YARA_RULES_DIR", "rules")
+YARA_MAX_MATCHES = int(os.getenv("YARA_MAX_MATCHES", "100"))
+
+_presidio_engine = None
+_presidio_error = None
+_yara_rules = None
+_yara_error = None
 
 # Silence noisy Scapy warnings (e.g. unknown TLS cipher suites in malformed/legacy handshakes).
 logging.getLogger("scapy").setLevel(logging.ERROR)
@@ -117,6 +136,7 @@ class CaptureState:
     def __init__(self):
         self.is_capturing = False
         self.interface = None
+        self.capture_source = None
         self.packet_queue = asyncio.Queue()
         self.capture_thread = None
         self.loop = None
@@ -177,6 +197,10 @@ def format_detail_value(val):
     if len(text) <= MAX_FIELD_TEXT_CHARS:
         return text
     return f"{text[:MAX_FIELD_TEXT_CHARS]} ... (truncated {len(text)} chars)"
+
+def sanitize_field_name(value: str) -> str:
+    cleaned = re.sub(r'[^A-Za-z0-9_.\-\[\]]+', '_', str(value).strip())
+    return cleaned.strip('_') if cleaned else ""
 
 def is_sensitive_key(key: str) -> bool:
     key_lower = str(key).lower()
@@ -303,6 +327,177 @@ def maybe_decode_base64(value: str):
         return None
     return decoded_text
 
+def get_presidio_engine():
+    global _presidio_engine, _presidio_error
+    if _presidio_engine is not None or _presidio_error is not None:
+        return _presidio_engine
+    if not ENABLE_PRESIDIO:
+        _presidio_error = "disabled"
+        return None
+    try:
+        from presidio_analyzer import AnalyzerEngine
+        from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+        provider = NlpEngineProvider(
+            nlp_configuration={
+                "nlp_engine_name": "spacy",
+                "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}]
+            }
+        )
+        nlp_engine = provider.create_engine()
+        _presidio_engine = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["en"])
+    except Exception as exc:
+        _presidio_error = str(exc)
+        print(f"Presidio disabled: {exc}")
+        return None
+    return _presidio_engine
+
+def extract_presidio_entities(text: str, src: str, dst: str, results, seen_keys, packet_no: Optional[int] = None):
+    engine = get_presidio_engine()
+    if not engine:
+        return
+    if not text:
+        return
+    sample = text[:PRESIDIO_MAX_TEXT_CHARS]
+    try:
+        findings = engine.analyze(text=sample, language="en")
+    except Exception:
+        return
+
+    for finding in findings:
+        if finding.score < PRESIDIO_MIN_SCORE:
+            continue
+        try:
+            value = sample[finding.start:finding.end]
+        except Exception:
+            continue
+        entity_type = str(getattr(finding, "entity_type", "")).upper()
+        if PRESIDIO_ALLOWED_ENTITIES and entity_type not in PRESIDIO_ALLOWED_ENTITIES:
+            continue
+        value = value.strip(" \t\r\n\"'<>[]()")
+        if not looks_user_visible_value(value):
+            continue
+        if any(ch in value for ch in ("&", "=")) and entity_type not in {"URL", "EMAIL_ADDRESS"}:
+            continue
+        entity = sanitize_field_name(entity_type.lower() if entity_type else "pii")
+        field = f"pii_{entity}" if entity else "pii"
+        append_credential_result(results, seen_keys, src, dst, field, value, "presidio", packet_no=packet_no)
+
+def get_yara_rules():
+    global _yara_rules, _yara_error
+    if _yara_rules is not None or _yara_error is not None:
+        return _yara_rules
+    if not ENABLE_YARA:
+        _yara_error = "disabled"
+        return None
+    try:
+        import yara
+
+        if not os.path.isdir(YARA_RULES_DIR):
+            _yara_error = "rules directory missing"
+            return None
+
+        rule_files = []
+        for root, _, files in os.walk(YARA_RULES_DIR):
+            for name in files:
+                if name.lower().endswith((".yar", ".yara")):
+                    rule_files.append(os.path.join(root, name))
+
+        if not rule_files:
+            _yara_error = "no rules found"
+            return None
+
+        file_map = {f"rule_{idx}": path for idx, path in enumerate(rule_files)}
+        _yara_rules = yara.compile(filepaths=file_map)
+    except Exception as exc:
+        _yara_error = str(exc)
+        print(f"YARA disabled: {exc}")
+        return None
+    return _yara_rules
+
+def iter_yara_match_strings(match):
+    try:
+        for item in match.strings:
+            if hasattr(item, "instances"):
+                for inst in item.instances:
+                    data = getattr(inst, "matched_data", None)
+                    if data:
+                        yield data
+            elif isinstance(item, (tuple, list)) and len(item) >= 3:
+                data = item[2]
+                if data:
+                    yield data
+    except Exception:
+        return
+
+def normalize_yara_match(text: str):
+    raw = str(text).replace("\x00", "").strip()
+    if not raw:
+        return None, None
+
+    line = raw.splitlines()[0].strip()
+    if not line:
+        return None, None
+
+    auth_match = re.match(r'(?i)^authorization\s*:\s*(.+)$', line)
+    if auth_match:
+        return "authorization", auth_match.group(1).strip()
+
+    bearer_match = re.match(r'(?i)^bearer\s+(.+)$', line)
+    if bearer_match:
+        return "bearer", bearer_match.group(1).strip()
+
+    basic_match = re.match(r'(?i)^basic\s+(.+)$', line)
+    if basic_match:
+        return "basic", basic_match.group(1).strip()
+
+    kv_quoted = re.match(r'^\s*"?([A-Za-z0-9_.\-\[\]]{2,80})"?\s*[:=]\s*"([^\"]{1,240})', line)
+    if kv_quoted:
+        return kv_quoted.group(1), kv_quoted.group(2).strip()
+
+    kv_unquoted = re.match(r'^\s*([A-Za-z0-9_.\-\[\]]{2,80})\s*[:=]\s*([^&\r\n;]{1,240})', line)
+    if kv_unquoted:
+        value = kv_unquoted.group(2).strip().strip('"\'')
+        return kv_unquoted.group(1), value
+
+    if line.startswith("tok_"):
+        return "token", line
+
+    if JWT_REGEX.match(line):
+        return "jwt", line
+
+    return "yara_match", line.strip('"\'')
+
+def extract_yara_matches(payload: bytes, src: str, dst: str, results, seen_keys, packet_no: Optional[int] = None):
+    rules = get_yara_rules()
+    if not rules or not payload:
+        return
+
+    sample = payload[:MAX_PAYLOAD_SCAN_BYTES]
+    try:
+        matches = rules.match(data=sample)
+    except Exception:
+        return
+
+    found = 0
+    for match in matches:
+        for data in iter_yara_match_strings(match):
+            if found >= YARA_MAX_MATCHES:
+                return
+            if isinstance(data, bytes):
+                value = data.decode("utf-8", "replace")
+            else:
+                value = str(data)
+
+            field, cleaned = normalize_yara_match(value)
+            if not field or not cleaned:
+                continue
+
+            if not looks_user_visible_value(cleaned):
+                continue
+            append_credential_result(results, seen_keys, src, dst, field, cleaned, "yara", packet_no=packet_no)
+            found += 1
+
 def extract_ftp_info(packet, sport: int, dport: int) -> str:
     if Raw not in packet:
         return f"FTP Port: {sport} -> {dport}"
@@ -376,6 +571,10 @@ def cleartext_importance_score(field: str, value: str) -> int:
 
     if is_noise_field_name(field_name):
         score -= 50
+    if field_name.startswith("pii_"):
+        score += 60
+    if field_name.startswith("yara_"):
+        score += 45
     if is_sensitive_key(field_name):
         score += 55
     if IMPORTANT_FIELD_HINT_REGEX.search(field_name):
@@ -623,8 +822,16 @@ def scan_credentials_in_text(text: str, src: str, dst: str, method: str, results
             continue
         append_credential_result(results, seen_keys, src, dst, field, value, method, packet_no=packet_no)
 
-def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_keys, is_http_request: bool = False, packet_no: Optional[int] = None):
-    if not payload:
+def extract_credentials_from_payload(
+    payload: bytes,
+    src: str,
+    dst: str,
+    seen_keys,
+    is_http_request: bool = False,
+    packet_no: Optional[int] = None,
+    extra_text: Optional[str] = None
+):
+    if not payload and not extra_text:
         return []
 
     sample = payload[:MAX_PAYLOAD_SCAN_BYTES]
@@ -641,11 +848,13 @@ def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_ke
 
     # Cheap pre-filter to avoid expensive parsing on irrelevant payloads.
     if not any(token in text_lower for token in ("=", ":", "content-disposition", "{", "}", "?", "post ")):
-        return []
+        if not (ENABLE_PRESIDIO or ENABLE_YARA):
+            return []
 
     # Only process request-like payloads or body-like chunks (multipart/form/json/query fragments).
     if not request_like and not any(token in text_lower for token in ("content-disposition: form-data", "&", "=", "{")):
-        return []
+        if not (ENABLE_PRESIDIO or ENABLE_YARA):
+            return []
 
     results = []
 
@@ -661,94 +870,109 @@ def extract_credentials_from_payload(payload: bytes, src: str, dst: str, seen_ke
     if not request_like and "content-disposition: form-data" not in text_lower:
         return []
 
-    if "content-disposition: form-data" in text_lower:
-        multipart_fields = extract_multipart_fields(text)
-        for field_name, field_value in multipart_fields:
-            if not looks_user_visible_value(field_value):
-                continue
-            append_credential_result(results, seen_keys, src, dst, field_name, field_value, "multipart", packet_no=packet_no)
+    # if "content-disposition: form-data" in text_lower:
+    #     multipart_fields = extract_multipart_fields(text)
+    #     for field_name, field_value in multipart_fields:
+    #         if not looks_user_visible_value(field_value):
+    #             continue
+    #         append_credential_result(results, seen_keys, src, dst, field_name, field_value, "multipart", packet_no=packet_no)
 
-    if body_for_parse:
-        try:
-            pairs = parse_qsl(body_for_parse, keep_blank_values=True)
-        except Exception:
-            pairs = []
-
-        pending_field = None
-        indexed_fields = {}
-        for key, value in pairs:
-            key_clean = key.strip()
-            key_lower = key_clean.lower()
-            value_clean = value.strip()
-
-            indexed_match = FORM_INDEXED_PAIR_REGEX.search(key_lower)
-            if indexed_match:
-                idx = indexed_match.group(1)
-                kind = indexed_match.group(2).lower()
-                if idx not in indexed_fields:
-                    indexed_fields[idx] = {}
-                indexed_fields[idx][kind] = value_clean
-
-            if key_lower in {"name", "field_name", "input_name"}:
-                pending_field = value_clean
-                continue
-
-            if key_lower in {"value", "field_value", "input_value"} and pending_field:
-                if looks_user_visible_value(value_clean):
-                    append_credential_result(results, seen_keys, src, dst, pending_field, value_clean, "form-decoded", packet_no=packet_no)
-                pending_field = None
-                continue
-
-            if looks_user_visible_value(value_clean):
-                append_credential_result(results, seen_keys, src, dst, key_clean, value_clean, "form-decoded", packet_no=packet_no)
-            
-
-        for pair in indexed_fields.values():
-            field_name = pair.get("name", "").strip()
-            field_value = pair.get("value", "").strip()
-            if field_name and looks_user_visible_value(field_value):
-                append_credential_result(results, seen_keys, src, dst, field_name, field_value, "form-decoded", packet_no=packet_no)
+    # if body_for_parse:
+    #     try:
+    #         pairs = parse_qsl(body_for_parse, keep_blank_values=True)
+    #     except Exception:
+    #         pairs = []
+    #
+    #     pending_field = None
+    #     indexed_fields = {}
+    #     for key, value in pairs:
+    #         key_clean = key.strip()
+    #         key_lower = key_clean.lower()
+    #         value_clean = value.strip()
+    #
+    #         indexed_match = FORM_INDEXED_PAIR_REGEX.search(key_lower)
+    #         if indexed_match:
+    #             idx = indexed_match.group(1)
+    #             kind = indexed_match.group(2).lower()
+    #             if idx not in indexed_fields:
+    #                 indexed_fields[idx] = {}
+    #             indexed_fields[idx][kind] = value_clean
+    #
+    #         if key_lower in {"name", "field_name", "input_name"}:
+    #             pending_field = value_clean
+    #             continue
+    #
+    #         if key_lower in {"value", "field_value", "input_value"} and pending_field:
+    #             if looks_user_visible_value(value_clean):
+    #                 append_credential_result(results, seen_keys, src, dst, pending_field, value_clean, "form-decoded", packet_no=packet_no)
+    #             pending_field = None
+    #             continue
+    #
+    #         if looks_user_visible_value(value_clean):
+    #             append_credential_result(results, seen_keys, src, dst, key_clean, value_clean, "form-decoded", packet_no=packet_no)
+    #
+    #     for pair in indexed_fields.values():
+    #         field_name = pair.get("name", "").strip()
+    #         field_value = pair.get("value", "").strip()
+    #         if field_name and looks_user_visible_value(field_value):
+    #             append_credential_result(results, seen_keys, src, dst, field_name, field_value, "form-decoded", packet_no=packet_no)
 
     scan_target = body_part if body_part else text
-    if "content-disposition: form-data" not in text_lower:
-        scan_credentials_in_text(scan_target, src, dst, "plaintext", results, seen_keys, packet_no=packet_no)
+    # if "content-disposition: form-data" not in text_lower:
+    #     scan_credentials_in_text(scan_target, src, dst, "plaintext", results, seen_keys, packet_no=packet_no)
 
+    decoded_url = None
     if '%' in text:
         decoded_url = unquote_plus(text)
-        if decoded_url != text:
-            scan_credentials_in_text(decoded_url, src, dst, "url-decoded", results, seen_keys, packet_no=packet_no)
+        # if decoded_url != text:
+        #     scan_credentials_in_text(decoded_url, src, dst, "url-decoded", results, seen_keys, packet_no=packet_no)
 
-    for token in BASIC_AUTH_REGEX.findall(text):
-        decoded_auth = maybe_decode_base64(token)
-        if decoded_auth and ':' in decoded_auth:
-            user, pwd = decoded_auth.split(':', 1)
-            append_credential_result(results, seen_keys, src, dst, "username", user, "basic-auth", packet_no=packet_no)
-            append_credential_result(results, seen_keys, src, dst, "password", pwd, "basic-auth", packet_no=packet_no)
+    if ENABLE_PRESIDIO:
+        presidio_target = scan_target
+        if extra_text:
+            presidio_target = f"{extra_text}\n{scan_target}" if presidio_target else extra_text
+        extract_presidio_entities(presidio_target, src, dst, results, seen_keys, packet_no=packet_no)
+        if decoded_url and decoded_url != text:
+            extract_presidio_entities(decoded_url, src, dst, results, seen_keys, packet_no=packet_no)
 
-    try:
-        first_line = text.splitlines()[0] if text else ""
-        if ' ' in first_line and '?' in first_line:
-            parts = first_line.split(' ')
-            if len(parts) >= 2 and '?' in parts[1]:
-                query_str = parts[1].split('?', 1)[1]
-                for key, value in parse_qsl(query_str, keep_blank_values=True):
-                    if looks_user_visible_value(value):
-                        append_credential_result(results, seen_keys, src, dst, key, value, "query-string", packet_no=packet_no)
-    except Exception:
-        pass
+    # for token in BASIC_AUTH_REGEX.findall(text):
+    #     decoded_auth = maybe_decode_base64(token)
+    #     if decoded_auth and ':' in decoded_auth:
+    #         user, pwd = decoded_auth.split(':', 1)
+    #         append_credential_result(results, seen_keys, src, dst, "username", user, "basic-auth", packet_no=packet_no)
+    #         append_credential_result(results, seen_keys, src, dst, "password", pwd, "basic-auth", packet_no=packet_no)
 
-    try:
-        if "{" in text and "}" in text:
-            body = text.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in text else text
-            body = body.strip()
-            if body.startswith("{") and body.endswith("}"):
-                parsed = json.loads(body)
-                if isinstance(parsed, dict):
-                    for key, value in parsed.items():
-                        if isinstance(value, (str, int, float, bool)) and looks_user_visible_value(value):
-                            append_credential_result(results, seen_keys, src, dst, key, value, "json", packet_no=packet_no)
-    except Exception:
-        pass
+    # try:
+    #     first_line = text.splitlines()[0] if text else ""
+    #     if ' ' in first_line and '?' in first_line:
+    #         parts = first_line.split(' ')
+    #         if len(parts) >= 2 and '?' in parts[1]:
+    #             query_str = parts[1].split('?', 1)[1]
+    #             for key, value in parse_qsl(query_str, keep_blank_values=True):
+    #                 if looks_user_visible_value(value):
+    #                     append_credential_result(results, seen_keys, src, dst, key, value, "query-string", packet_no=packet_no)
+    # except Exception:
+    #     pass
+
+    # try:
+    #     if "{" in text and "}" in text:
+    #         body = text.split("\r\n\r\n", 1)[1] if "\r\n\r\n" in text else text
+    #         body = body.strip()
+    #         if body.startswith("{") and body.endswith("}"):
+    #             parsed = json.loads(body)
+    #             if isinstance(parsed, dict):
+    #                 for key, value in parsed.items():
+    #                     if isinstance(value, (str, int, float, bool)) and looks_user_visible_value(value):
+    #                         append_credential_result(results, seen_keys, src, dst, key, value, "json", packet_no=packet_no)
+    # except Exception:
+    #     pass
+
+    if ENABLE_YARA:
+        yara_payload = sample
+        if extra_text:
+            extra_bytes = extra_text.encode("utf-8", "ignore")
+            yara_payload = (extra_bytes + b"\n" + sample)[:MAX_PAYLOAD_SCAN_BYTES]
+        extract_yara_matches(yara_payload, src, dst, results, seen_keys, packet_no=packet_no)
 
     return results
 
@@ -769,6 +993,40 @@ def packet_to_dict(packet):
         layers.append({"layer": layer_name, "fields": fields})
         counter += 1
     return layers
+
+def build_http_request_text(http_layer) -> str:
+    if http_layer is None:
+        return ""
+
+    parts = []
+    try:
+        method = http_layer.Method.decode("utf-8", "ignore") if getattr(http_layer, "Method", None) else ""
+        path = http_layer.Path.decode("utf-8", "ignore") if getattr(http_layer, "Path", None) else ""
+        version = ""
+        if hasattr(http_layer, "Http_Version") and http_layer.Http_Version:
+            version = http_layer.Http_Version.decode("utf-8", "ignore")
+        if method and path:
+            line = f"{method} {path} {version}".strip()
+            parts.append(line)
+    except Exception:
+        pass
+
+    try:
+        for key, value in http_layer.fields.items():
+            if key in {"Method", "Path", "Http_Version"}:
+                continue
+            if value is None:
+                continue
+            if isinstance(value, bytes):
+                text_value = value.decode("utf-8", "ignore")
+            else:
+                text_value = str(value)
+            header_name = key.replace("_", "-")
+            parts.append(f"{header_name}: {text_value}")
+    except Exception:
+        pass
+
+    return "\r\n".join(part for part in parts if part).strip()
 
 def cache_packet_detail(pkt_id: int, detail):
     capture_state.packet_cache[pkt_id] = detail
@@ -953,6 +1211,7 @@ async def start_capture(request: StartCaptureRequest):
 
     capture_state.interface = request.interface
     capture_state.is_capturing = True
+    capture_state.capture_source = "live"
     capture_state.loop = asyncio.get_running_loop()
     capture_state.packet_cache.clear()
     capture_state.flow_states.clear()
@@ -1116,17 +1375,21 @@ async def analyze_capture():
                         if 'R' in tcp_flags:
                             tcp_resets += 1
                             
-                        if Raw in packet:
-                            payload = packet[Raw].load
+                        if Raw in packet or (HTTPRequest is not None and packet.haslayer(HTTPRequest)):
+                            payload = packet[Raw].load if Raw in packet else b""
                             if len(credentials) < 5000:
                                 is_http_request_packet = HTTPRequest is not None and packet.haslayer(HTTPRequest)
+                                extra_text = ""
+                                if is_http_request_packet:
+                                    extra_text = build_http_request_text(packet.getlayer(HTTPRequest))
                                 extracted = extract_credentials_from_payload(
                                     payload,
                                     src,
                                     dst,
                                     credential_seen,
                                     is_http_request=is_http_request_packet,
-                                    packet_no=total_packets
+                                    packet_no=total_packets,
+                                    extra_text=extra_text
                                 )
 
                                 if tcp.sport in (20, 21) or tcp.dport in (20, 21):
@@ -1393,6 +1656,8 @@ async def download_evidence(req: EvidenceRequest):
 
 @app.get("/api/download")
 async def download_pcap():
+    if capture_state.capture_source != "live":
+        raise HTTPException(status_code=403, detail="PCAP download is only available for live captures.")
     if not os.path.exists("session.pcap"):
         raise HTTPException(status_code=404, detail="No capture data found.")
     return FileResponse("session.pcap", filename="session.pcap", media_type="application/vnd.tcpdump.pcap")
@@ -1437,6 +1702,8 @@ async def upload_pcap(file: UploadFile = File(...)):
             shutil.copyfileobj(file.file, buffer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+    capture_state.capture_source = "upload"
 
     try:
         file_size = os.path.getsize(file_path)

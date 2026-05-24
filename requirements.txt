@@ -2,3 +2,5 @@ fastapi
 uvicorn
 scapy
 websockets
+presidio-analyzer
+yara-python

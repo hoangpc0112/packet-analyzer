@@ -5,6 +5,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnStop = document.getElementById('btn-stop');
     const btnClear = document.getElementById('btn-clear');
     const btnUpload = document.getElementById('btn-upload');
+    const btnDownload = document.getElementById('btn-download');
     const pcapUpload = document.getElementById('pcap-upload');
     const packetList = document.getElementById('packet-list');
     const emptyState = document.getElementById('empty-state');
@@ -45,6 +46,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let packetSort = { key: null, direction: 'asc' };
     let renderTimer = null;
     let statsTimer = null;
+    const CAPTURE_SOURCE_LIVE = 'live';
+    const CAPTURE_SOURCE_UPLOAD = 'upload';
+    let captureSource = null;
     
     let packetStats = { total: 0, byProtocol: {} };
     const selectedProtocolFilters = new Set();
@@ -68,6 +72,43 @@ document.addEventListener('DOMContentLoaded', () => {
         if (typeof bytes !== 'number') return '-';
         return `${(bytes / 1024).toFixed(2)} KB`;
     };
+
+    const setDownloadEnabled = (enabled) => {
+        if (!btnDownload) return;
+        btnDownload.setAttribute('aria-disabled', String(!enabled));
+        if (enabled) {
+            const href = btnDownload.dataset.href || '/api/download';
+            const filename = btnDownload.dataset.download || 'session.pcap';
+            btnDownload.setAttribute('href', href);
+            btnDownload.setAttribute('download', filename);
+            btnDownload.removeAttribute('tabindex');
+        } else {
+            btnDownload.setAttribute('href', '#');
+            btnDownload.removeAttribute('download');
+            btnDownload.setAttribute('tabindex', '-1');
+        }
+    };
+
+    const setCaptureSource = (source) => {
+        captureSource = source;
+        setDownloadEnabled(captureSource === CAPTURE_SOURCE_LIVE);
+    };
+
+    if (btnDownload) {
+        if (!btnDownload.dataset.href) {
+            btnDownload.dataset.href = btnDownload.getAttribute('href') || '/api/download';
+        }
+        if (!btnDownload.dataset.download) {
+            btnDownload.dataset.download = btnDownload.getAttribute('download') || 'session.pcap';
+        }
+        setDownloadEnabled(false);
+        btnDownload.addEventListener('click', (event) => {
+            if (btnDownload.getAttribute('aria-disabled') === 'true') {
+                event.preventDefault();
+                event.stopPropagation();
+            }
+        });
+    }
 
     const getSummaryRows = (analysisData) => {
         const summary = (analysisData || {}).summary || {};
@@ -1164,6 +1205,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await res.json();
             if (data.status === 'started' || data.status === 'already capturing') {
                 isCapturing = true;
+                setCaptureSource(CAPTURE_SOURCE_LIVE);
                 btnStart.disabled = true;
                 btnStop.disabled = false;
                 interfaceSelect.disabled = true;
@@ -1213,6 +1255,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btnUpload.disabled = false;
         interfaceSelect.disabled = false;
         statusIndicator.classList.remove('capturing');
+        setDownloadEnabled(captureSource === CAPTURE_SOURCE_LIVE);
     };
 
     // Event Listeners
@@ -1389,6 +1432,8 @@ document.addEventListener('DOMContentLoaded', () => {
     pcapUpload.addEventListener('change', async (e) => {
         const file = e.target.files[0];
         if (!file) return;
+
+        setCaptureSource(CAPTURE_SOURCE_UPLOAD);
 
         const formData = new FormData();
         formData.append('file', file);
