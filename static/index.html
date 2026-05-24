@@ -62,9 +62,15 @@
                 <button id="btn-start" class="btn btn-primary" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;" disabled>Start Capture</button>
                 <button id="btn-stop" class="btn btn-danger" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;" disabled>Stop</button>
                 <button id="btn-clear" class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.85rem;">Clear</button>
-                <div style="flex: 1; margin-left: auto;">
-                    <input type="text" id="display-filter" class="input-field" style="width: 100%; font-size: 0.85rem; padding: 0.4rem 0.75rem;"
-                        placeholder="Filter (e.g. tcp.port == 443, ip.src == 192.168.1.1, protocol == DNS)...">
+                <div style="flex: 1; margin-left: auto; display: flex; gap: 0.5rem; align-items: center;">
+                    <input type="text" id="display-filter" class="input-field" style="flex: 1; font-size: 0.85rem; padding: 0.4rem 0.75rem;"
+                        placeholder="Nhập bộ lọc Wireshark hoặc mô tả bằng ngôn ngữ tự nhiên...">
+                    <button id="btn-filter" class="btn btn-secondary" style="padding: 0.4rem 0.75rem; font-size: 0.85rem; display: flex; align-items: center; gap: 0.25rem; white-space: nowrap;">
+                        🔍 Lọc thường
+                    </button>
+                    <button id="btn-ai-filter" class="btn btn-primary" style="padding: 0.4rem 0.75rem; font-size: 0.85rem; display: flex; align-items: center; gap: 0.25rem; white-space: nowrap; transition: all 0.3s ease; background: linear-gradient(135deg, #a855f7, #6366f1); border: none;" title="Dịch bộ lọc bằng ngôn ngữ tự nhiên (AI/Rule Hybrid)">
+                        ✨ Lọc bằng AI
+                    </button>
                 </div>
             </div>
 
